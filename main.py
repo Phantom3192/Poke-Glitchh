@@ -30,6 +30,7 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
 
 import os
 import io
+import sys
 import time
 import asyncio
 import logging
@@ -46,7 +47,21 @@ from train_model import Database, MODEL_OUTPUT
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# train_model.py (imported above) redirects sys.stderr to /dev/null and disables
+# every logger that existed at import time (including discord.py's). That hid
+# all bot logs on the host. Undo it: re-enable loggers and send logs to stdout.
+for _name in list(logging.root.manager.loggerDict.keys()):
+    _lg = logging.getLogger(_name)
+    _lg.disabled = False
+    if _lg.level == logging.CRITICAL:
+        _lg.setLevel(logging.NOTSET)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 log = logging.getLogger("discord_bot")
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -294,7 +309,7 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
 
 def main():
     _load_model_and_bank()
-    bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN, log_handler=None)  # we configured logging above (stdout)
 
 
 if __name__ == "__main__":
