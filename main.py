@@ -47,21 +47,23 @@ from train_model import Database, MODEL_OUTPUT
 
 load_dotenv()
 
-# train_model.py (imported above) redirects sys.stderr to /dev/null and disables
-# every logger that existed at import time (including discord.py's). That hid
-# all bot logs on the host. Undo it: re-enable loggers and send logs to stdout.
+# train_model.py (imported above) silences logging in several ways:
+#   - replaces logging.basicConfig with a no-op lambda
+#   - disables every logger that existed at import time (incl. discord.py's)
+#   - redirects sys.stderr to /dev/null
+# So basicConfig() can't be used here. Undo it by attaching a stdout handler
+# to the root logger directly and re-enabling the disabled loggers.
 for _name in list(logging.root.manager.loggerDict.keys()):
     _lg = logging.getLogger(_name)
     _lg.disabled = False
     if _lg.level == logging.CRITICAL:
         _lg.setLevel(logging.NOTSET)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+_root = logging.getLogger()
+_root.handlers = [_handler]
+_root.setLevel(logging.INFO)
 log = logging.getLogger("discord_bot")
 
 # ── Config ───────────────────────────────────────────────────────────────
