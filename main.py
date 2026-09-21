@@ -25,6 +25,8 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
     s!forget <species>   - remove the examples you taught for that species
     s!undo               - remove the most recent example you taught
     s!stats              - show how many species/features are loaded
+    s!api                - live performance dashboard (activity, active incense,
+                           inference/response times, cache hit rate, Pokémon named)
     s!reload             - re-load the model + feature bank from disk/DB
     s!threshold X        - view/change the confidence threshold at runtime
 
@@ -46,7 +48,7 @@ import asyncio
 import difflib
 import logging
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple
 
@@ -138,6 +140,10 @@ CACHE_SIZE = max(0, int(os.getenv("CACHE_SIZE", "5000")))
 # warm-up. Set CACHE_FILE="" to disable.
 CACHE_FILE = os.getenv("CACHE_FILE", "spawn_cache.pkl")
 CACHE_SAVE_INTERVAL = float(os.getenv("CACHE_SAVE_INTERVAL", "60"))
+# s!api dashboard: rolling window for timing stats, and how recently a channel
+# must have spawned to count as an "active incense" channel.
+METRICS_WINDOW = float(os.getenv("METRICS_WINDOW", "300"))
+ACTIVE_INCENSE_WINDOW = float(os.getenv("ACTIVE_INCENSE_WINDOW", "60"))
 
 torch.set_num_threads(TORCH_THREADS)
 _executor = ThreadPoolExecutor(max_workers=INFER_WORKERS, thread_name_prefix="infer")
@@ -248,6 +254,104 @@ def _cache_put(digest: str, result: tuple, version: int, url: Optional[str] = No
 
 async def _in_executor(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(_executor, fn, *args)
+
+
+# ── s!api metrics (rolling window) ───────────────────────────────────────
+_metrics_lock = threading.Lock()
+_m_inference: deque = deque()   # (ts, ms) model forward pass, one entry per real inference
+_m_store: deque = deque()       # (ts, ms) feature-bank lookup + vote
+_m_response: deque = deque()    # (ts, ms) spawn seen -> reply sent
+_m_spawns: deque = deque()      # (ts, 1)  every spawn seen
+_channel_last_spawn: Dict[int, float] = {}
+_named_total = 0
+
+
+def _m_add(dq: deque, value):
+    now = time.time()
+    with _metrics_lock:
+        dq.append((now, value))
+        cutoff = now - METRICS_WINDOW
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+
+def _m_values(dq: deque, since: Optional[float] = None):
+    cutoff = time.time() - (METRICS_WINDOW if since is None else since)
+    with _metrics_lock:
+        return [v for ts, v in dq if ts >= cutoff]
+
+
+def _fmt_ms(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    return f"{v / 1000:.3f}s" if v >= 1000 else f"{v:.0f} ms"
+
+
+def _activity(rate: float):
+    """rate = spawns/sec over the last minute -> (label, embed colour name)."""
+    if rate <= 0:
+        return "⚪ Idle", "light_grey"
+    if rate < 2:
+        return "🟢 Low Activity", "green"
+    if rate < 6:
+        return "🟡 Moderate Activity", "gold"
+    if rate < 15:
+        return "🟠 High Activity", "orange"
+    return "🔴 Very High Activity", "red"
+
+
+def _api_snapshot() -> dict:
+    now = time.time()
+    inf, store, resp = _m_values(_m_inference), _m_values(_m_store), _m_values(_m_response)
+    spawns = len(_m_values(_m_spawns))
+    rate = len(_m_values(_m_spawns, since=60)) / 60.0
+    for cid in [c for c, t in _channel_last_spawn.items() if now - t > METRICS_WINDOW]:
+        del _channel_last_spawn[cid]
+    active = sum(1 for t in _channel_last_spawn.values() if now - t <= ACTIVE_INCENSE_WINDOW)
+
+    def stats(vals):
+        return (min(vals), max(vals), sum(vals) / len(vals), vals[-1]) if vals else (None,) * 4
+
+    label, color = _activity(rate)
+    _, _, matrix = _snapshot()
+    return {
+        "activity": label, "color": color, "rate": rate, "active": active,
+        "hit_rate": None if spawns == 0 else max(0.0, 1.0 - len(inf) / spawns),
+        "store": stats(store), "inference": stats(inf), "response": stats(resp),
+        "bank": int(matrix.shape[0]), "named": _named_total,
+    }
+
+
+def _build_api_embed() -> discord.Embed:
+    d = _api_snapshot()
+    embed = discord.Embed(title="API Status", color=getattr(discord.Color, d["color"])())
+
+    def field(name, value):
+        embed.add_field(name=name, value=value, inline=True)
+
+    s_min, s_max, s_avg, s_last = d["store"]
+    i_min, i_max, i_avg, i_last = d["inference"]
+    r_min, r_max, r_avg, r_last = d["response"]
+    field("Activity", d["activity"])
+    field("Active Incense", f"`{d['active']}`")
+    field("Cache Hit Rate", "—" if d["hit_rate"] is None else f"{d['hit_rate'] * 100:.0f}%")
+    field("Store (latest)", _fmt_ms(s_last))
+    field("Store (avg)", _fmt_ms(s_avg))
+    field("Bank Size", f"{d['bank']:,}")
+    field("Inference Fastest", _fmt_ms(i_min))
+    field("Inference Slowest", _fmt_ms(i_max))
+    field("Inference Avg", _fmt_ms(i_avg))
+    field("Inference Latest", _fmt_ms(i_last))
+    field("Response Fastest", _fmt_ms(r_min))
+    field("Response Slowest", _fmt_ms(r_max))
+    field("Response Avg", _fmt_ms(r_avg))
+    field("Response Latest", _fmt_ms(r_last))
+    field("Pokémons Named", f"{d['named']:,}")
+    embed.set_footer(
+        text=f"Model: {os.path.basename(BOT_MODEL_PATH)} | Backend: PyTorch CPU "
+             f"(threads={TORCH_THREADS}, workers={INFER_WORKERS}) | Window: {METRICS_WINDOW / 60:g} min rolling"
+    )
+    return embed
 
 
 def _bank_fingerprint():
@@ -457,8 +561,13 @@ def _predict(query_vec: np.ndarray, species_list, matrix):
 def _run_identification(image_bytes: bytes):
     """Runs in a worker thread — torch inference + numpy matmul are blocking/CPU-bound."""
     _, species_list, matrix = _snapshot()
+    t0 = time.perf_counter()
     query_vec = _embed_image_bytes(image_bytes)
+    t1 = time.perf_counter()
     winner, score, neighbors = _predict(query_vec, species_list, matrix)
+    t2 = time.perf_counter()
+    _m_add(_m_inference, (t1 - t0) * 1000)
+    _m_add(_m_store, (t2 - t1) * 1000)
     return winner, score, neighbors, query_vec
 
 
@@ -667,6 +776,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    global _named_total
     await bot.process_commands(message)
 
     if message.author.id != SPAWN_BOT_ID:
@@ -684,6 +794,8 @@ async def on_message(message: discord.Message):
 
     received = time.time()
     cid = message.channel.id
+    _m_add(_m_spawns, 1)
+    _channel_last_spawn[cid] = received
     gen = _spawn_gen.get(cid, 0) + 1
     _spawn_gen[cid] = gen  # a newer spawn in this channel supersedes this one if it's still working
 
@@ -719,6 +831,9 @@ async def on_message(message: discord.Message):
         await message.reply(reply_text, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         log.warning(f"Failed to reply to spawn message {message.id}: {e}")
+        return
+    _named_total += 1
+    _m_add(_m_response, (time.time() - received) * 1000)
 
 
 # ── Manual testing / admin commands ─────────────────────────────────────
@@ -852,6 +967,13 @@ async def undo_cmd(ctx: commands.Context):
         await ctx.send("ℹ️ Nothing to undo — no taught examples found.")
         return
     await ctx.send(f"↩️ Removed the latest taught example (**{_display(removed[0])}**).")
+
+
+@bot.command(name="api")
+@commands.is_owner()
+async def api_cmd(ctx: commands.Context):
+    """Live performance dashboard: activity, active incense, inference/response times, cache hit rate."""
+    await ctx.send(embed=_build_api_embed())
 
 
 @bot.command(name="stats")
