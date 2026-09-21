@@ -31,9 +31,18 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
     s!reload             - re-load the model + feature bank from disk/DB
     s!threshold X        - view/change the confidence threshold at runtime
 
-Optional auto-learning (AUTO_LEARN=true): when the spawn bot announces who
-caught what ("... You caught a Level 12 Pikachu!"), the bot learns from the
-last spawn in that channel if it guessed wrong or wasn't confident.
+Optional auto-learning (AUTO_LEARN=true): learns from the last spawn in a
+channel if the bot guessed it wrong or wasn't confident. Where the "correct"
+answer comes from is set by AUTO_LEARN_SOURCE:
+    - "catch" (default): the spawn bot's own catch announcement
+      ("... You caught a Level 12 Pikachu!").
+    - "bot": trust another bot's identification message instead (e.g. a
+      second spawn-guessing bot in the same channel). Set AUTO_LEARN_SOURCE_BOT_ID
+      to that bot's Discord user ID, and adjust AUTO_LEARN_SOURCE_REGEX if its
+      message format differs from the default "Species <emoji>: 99.86%" style.
+      AUTO_LEARN_SOURCE_MIN_CONFIDENCE sets how confident that bot must claim
+      to be before it's trusted.
+See .env.example for all auto-learn variables.
 """
 
 import os
@@ -169,12 +178,43 @@ _executor = ThreadPoolExecutor(max_workers=INFER_WORKERS, thread_name_prefix="in
 
 # ── Auto-learning (opt-in) ───────────────────────────────────────────────
 AUTO_LEARN = os.getenv("AUTO_LEARN", "false").lower() == "true"
+# Where the "ground truth" species comes from: "catch" (the spawn bot's own
+# catch announcement) or "bot" (trust another bot's identification message).
+AUTO_LEARN_SOURCE = os.getenv("AUTO_LEARN_SOURCE", "catch").strip().lower()
+AUTO_LEARN_MAX_AGE = int(os.getenv("AUTO_LEARN_MAX_AGE", "600"))  # seconds
+
+# -- AUTO_LEARN_SOURCE=catch --
 # Must capture the species name in group 1. Default matches Poketwo-style
 # "... You caught a Level 12 Pikachu! (20.1% IV)". Check your spawn bot's
 # real catch message and adjust via the CATCH_REGEX env var if needed.
 CATCH_REGEX = os.getenv("CATCH_REGEX", r"caught an? (?:level \d+ )?(.+?)\s*(?:!|\()")
-AUTO_LEARN_MAX_AGE = int(os.getenv("AUTO_LEARN_MAX_AGE", "600"))  # seconds
 _CATCH_RE = re.compile(CATCH_REGEX, re.IGNORECASE)
+
+# -- AUTO_LEARN_SOURCE=bot --
+# Discord user ID of the bot whose identification messages should be trusted
+# as ground truth (e.g. another spawn-guessing bot posting in the same
+# channel). Right-click / long-press the bot's name in Discord and "Copy
+# User ID" (Developer Mode must be on: User Settings > Advanced).
+AUTO_LEARN_SOURCE_BOT_ID = int(os.getenv("AUTO_LEARN_SOURCE_BOT_ID", "0") or 0)
+# Must capture the species name as group "species" and its stated confidence
+# (a bare number, no %) as group "confidence". Default matches messages like
+# "Timburr 🔶: 99.86%" / "Timburr: 99.86%\nBest name: Timburr".
+AUTO_LEARN_SOURCE_REGEX = os.getenv(
+    "AUTO_LEARN_SOURCE_REGEX",
+    r"^(?P<species>[A-Za-z][A-Za-z.\-' ]*?)\s+\S*:\s*(?P<confidence>[\d.]+)\s*%",
+)
+# Only trust the source bot's guess (and learn from it) if it claims at least
+# this much confidence in its own answer.
+AUTO_LEARN_SOURCE_MIN_CONFIDENCE = float(os.getenv("AUTO_LEARN_SOURCE_MIN_CONFIDENCE", "0.9"))
+_AUTO_LEARN_SOURCE_RE = re.compile(AUTO_LEARN_SOURCE_REGEX, re.IGNORECASE) if AUTO_LEARN_SOURCE == "bot" else None
+
+if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and not AUTO_LEARN_SOURCE_BOT_ID:
+    raise RuntimeError(
+        "AUTO_LEARN_SOURCE=bot requires AUTO_LEARN_SOURCE_BOT_ID to be set in your .env "
+        "to the Discord user ID of the bot to learn from."
+    )
+if AUTO_LEARN and AUTO_LEARN_SOURCE not in ("catch", "bot"):
+    raise RuntimeError(f"AUTO_LEARN_SOURCE must be 'catch' or 'bot', got {AUTO_LEARN_SOURCE!r}")
 
 # Rows added by s!learn / auto-learn carry this marker in variant_name, which
 # is how s!forget / s!undo tell them apart from the original training data.
@@ -900,6 +940,51 @@ async def _maybe_auto_learn(message: discord.Message):
              + (f" ({extra} examples now)" if status == "learned" else ""))
 
 
+async def _maybe_auto_learn_from_source_bot(message: discord.Message):
+    """AUTO_LEARN_SOURCE=bot: trust AUTO_LEARN_SOURCE_BOT_ID's identification
+    message as ground truth and learn from the last spawn in this channel if
+    our own guess disagreed with it (or wasn't confident)."""
+    text = _message_text(message)
+    match = _AUTO_LEARN_SOURCE_RE.search(text)
+    if not match:
+        log.info(f"Auto-learn (source bot): message didn't match AUTO_LEARN_SOURCE_REGEX: {text[:160]!r}")
+        return
+
+    claimed = match.group("species").strip()
+    try:
+        source_conf = float(match.group("confidence")) / 100.0
+    except (IndexError, ValueError):
+        source_conf = None
+
+    if source_conf is not None and source_conf < AUTO_LEARN_SOURCE_MIN_CONFIDENCE:
+        log.info(f"Auto-learn (source bot): '{claimed}' only {source_conf:.1%} confident — not trusted enough to learn from")
+        return
+
+    entry = _last_spawn.get(message.channel.id)
+    if not entry:
+        log.info(f"Auto-learn (source bot): '{claimed}' named but I have no analysed spawn for this channel — skipping")
+        return
+    spawned_at, guess, score, vec = entry
+    if time.time() - spawned_at > AUTO_LEARN_MAX_AGE:
+        log.info(f"Auto-learn (source bot): last spawn is too old to trust — skipping '{claimed}'")
+        return
+    _last_spawn[message.channel.id] = None  # learn from each spawn at most once
+
+    species = _find_species(claimed)
+    if species is None:
+        log.warning(f"Auto-learn (source bot): '{claimed}' isn't a species in my DB — use s!learn --new {claimed.lower()} if it's real")
+        return
+    if species == guess and score >= CONFIDENCE_THRESHOLD:
+        log.info(f"Auto-learn (source bot): guessed {species} correctly ({score:.3f}) — nothing to learn")
+        return
+
+    status, name, extra = await asyncio.to_thread(_learn_sync, species, vec, False)
+    verdict = "wrong" if species != guess else "low confidence"
+    log.info(f"Auto-learn (source bot): {message.author} said {species} ({source_conf if source_conf is not None else '?'}), "
+             f"I guessed {guess} ({score:.3f}, {verdict}) -> {status}"
+             + (f" ({extra} examples now)" if status == "learned" else ""))
+
+
 # ── Discord events ───────────────────────────────────────────────────────
 
 @bot.event
@@ -912,7 +997,14 @@ async def on_ready():
     log.info("=" * 60)
     log.info(f"🤖 Logged in as {bot.user} — scanning for spawns from bot ID {SPAWN_BOT_ID}")
     log.info(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}")
-    log.info(f"   Auto-learn: {'ON' if AUTO_LEARN else 'OFF'}")
+    if AUTO_LEARN:
+        source_desc = (
+            f"ON (source: bot #{AUTO_LEARN_SOURCE_BOT_ID})"
+            if AUTO_LEARN_SOURCE == "bot" else "ON (source: catch announcements)"
+        )
+    else:
+        source_desc = "OFF"
+    log.info(f"   Auto-learn: {source_desc}")
     log.info("=" * 60)
 
 
@@ -921,10 +1013,16 @@ async def on_message(message: discord.Message):
     global _named_total
     await bot.process_commands(message)
 
+    if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and message.author.id == AUTO_LEARN_SOURCE_BOT_ID:
+        try:
+            await _maybe_auto_learn_from_source_bot(message)
+        except Exception as e:
+            log.error(f"Auto-learn (source bot) failed: {type(e).__name__}: {e}")
+
     if message.author.id != SPAWN_BOT_ID:
         return
 
-    if AUTO_LEARN:
+    if AUTO_LEARN and AUTO_LEARN_SOURCE == "catch":
         try:
             await _maybe_auto_learn(message)
         except Exception as e:
@@ -1173,7 +1271,7 @@ async def stats_cmd(ctx: commands.Context):
         f"Backend: `{_backend_name}` · workers: `{INFER_WORKERS}` · threads: `{TORCH_THREADS}` · "
         f"avg batch: `{_stats['batch_items'] / max(1, _stats['batches']):.2f}` (max `{BATCH_MAX}`)\n"
         f"Model: `{BOT_MODEL_PATH}`\n"
-        f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` · Auto-learn: `{'on' if AUTO_LEARN else 'off'}`"
+        f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` · Auto-learn: `{'on (' + AUTO_LEARN_SOURCE + ')' if AUTO_LEARN else 'off'}`"
     )
 
 
