@@ -126,7 +126,7 @@ SILENT_BELOW_THRESHOLD = os.getenv("SILENT_BELOW_THRESHOLD", "false").lower() ==
 # /v1/predict/batch call, waiting at most BATCH_WAIT_MS for stragglers (0 =
 # only group what's already waiting, so it never adds latency).
 BATCH_MAX = max(1, int(os.getenv("BATCH_MAX", "4")))
-BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "25")))
+BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "0")))
 # How many /v1/predict(/batch) calls this bot will have in flight at once.
 API_CONCURRENCY = max(1, int(os.getenv("API_CONCURRENCY", "4")))
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
@@ -210,7 +210,9 @@ class ApiError(Exception):
 async def _get_session() -> aiohttp.ClientSession:
     global _session, _api_sem
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession()
+        _session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60, limit=0)
+        )
     if _api_sem is None:
         _api_sem = asyncio.Semaphore(API_CONCURRENCY)
     return _session
@@ -272,9 +274,14 @@ async def api_predict_batch(images_bytes: List[bytes], *, threshold: Optional[fl
     if include_embedding:
         params["include_embedding"] = "true"
     body = await _api_request("POST", "/v1/predict/batch", data=form, params=params)
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        # 2xx but not the batch payload: wrong AI_MODEL_API_URL, a proxy/starting page, or an old server.
+        snippet = json.dumps(body)[:300] if not isinstance(body, str) else body[:300]
+        raise ApiError(200, f"unexpected /v1/predict/batch response (no 'results'): {snippet}")
     out = []
-    for r in body["results"]:
-        out.append(r if r.get("ok") else None)
+    for r in results:
+        out.append(r if isinstance(r, dict) and r.get("ok") else None)
     return out
 
 
@@ -562,7 +569,7 @@ def _result_from_predict(data: dict) -> tuple:
 
 async def _identify_one(image_bytes: bytes) -> Optional[tuple]:
     try:
-        data = await api_predict(image_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=True)
+        data = await api_predict(image_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN)
     except ApiError as e:
         if e.status != 422:  # 422 = unreadable image, not worth logging as an error
             log.error(f"Predict API error: {e}")
@@ -578,7 +585,7 @@ async def _identify_one(image_bytes: bytes) -> Optional[tuple]:
 
 async def _identify_batch(images_bytes: List[bytes]) -> List[Optional[tuple]]:
     try:
-        results = await api_predict_batch(images_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=True)
+        results = await api_predict_batch(images_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN)
     except Exception as e:
         log.error(f"Batch predict API error ({type(e).__name__}): {e}")
         return [None] * len(images_bytes)
