@@ -39,16 +39,21 @@ import re
 import sys
 import json
 import time
+import pickle
+import hashlib
 import uuid
 import asyncio
 import difflib
 import logging
 import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple
 
 import aiohttp
 import discord
 import numpy as np
+import torch
 from discord.ext import commands
 from PIL import Image
 from dotenv import load_dotenv
@@ -117,6 +122,26 @@ NEAR_EXACT_SIM = float(os.getenv("NEAR_EXACT_SIM", "0.95"))
 # species already has, so the bank doesn't fill up with duplicates.
 LEARN_DUP_SIM = float(os.getenv("LEARN_DUP_SIM", "0.995"))
 
+# ── Throughput tuning (many channels at once, e.g. 100 incense @ 20s) ───
+# os.cpu_count() on Railway & co. reports the HOST's cores, not your quota, so
+# torch's default thread count badly oversubscribes a 1 vCPU plan. Defaults
+# below are for 1 vCPU; on N vCPU set INFER_WORKERS=N (keep TORCH_THREADS=1).
+INFER_WORKERS = max(1, int(os.getenv("INFER_WORKERS", "1")))
+TORCH_THREADS = max(1, int(os.getenv("TORCH_THREADS", "1")))
+# Skip a queued spawn if it waited longer than this (seconds) - the answer
+# would arrive too late to be useful, and skipping lets the queue catch up.
+MAX_SPAWN_AGE = float(os.getenv("MAX_SPAWN_AGE", "15"))
+# Max cached image results (LRU). Same image bytes/URL -> no inference at all.
+CACHE_SIZE = max(0, int(os.getenv("CACHE_SIZE", "5000")))
+# Cache is saved here every CACHE_SAVE_INTERVAL seconds and re-loaded on start
+# (only if the model + feature bank are unchanged), so restarts don't need a
+# warm-up. Set CACHE_FILE="" to disable.
+CACHE_FILE = os.getenv("CACHE_FILE", "spawn_cache.pkl")
+CACHE_SAVE_INTERVAL = float(os.getenv("CACHE_SAVE_INTERVAL", "60"))
+
+torch.set_num_threads(TORCH_THREADS)
+_executor = ThreadPoolExecutor(max_workers=INFER_WORKERS, thread_name_prefix="infer")
+
 # ── Auto-learning (opt-in) ───────────────────────────────────────────────
 AUTO_LEARN = os.getenv("AUTO_LEARN", "false").lower() == "true"
 # Must capture the species name in group 1. Default matches Poketwo-style
@@ -149,6 +174,201 @@ _session: Optional[aiohttp.ClientSession] = None
 # recent spawn we successfully analysed; None if we saw a spawn but couldn't.
 _last_spawn: Dict[int, Optional[Tuple[float, str, float, np.ndarray]]] = {}
 
+# channel_id -> generation counter; a newer spawn in a channel supersedes older
+# queued ones (they're skipped instead of wasting CPU on an outdated image).
+_spawn_gen: Dict[int, int] = {}
+
+# Result cache. Cleared whenever the feature bank changes (learn/forget/undo/
+# reload) so corrections always take effect. _bank_version stops a worker that
+# started before a change from writing a stale result afterwards.
+_cache_lock = threading.Lock()
+_result_cache: "OrderedDict[str, tuple]" = OrderedDict()   # sha1(image bytes) -> result tuple
+_url_cache: "OrderedDict[str, str]" = OrderedDict()        # image url -> sha1
+_bank_version = 0
+_stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0}
+_cache_dirty = False
+# In-flight work, so N channels spawning the same image at once cost ONE download/inference.
+_inflight_url: Dict[str, dict] = {}
+_inflight_digest: Dict[str, dict] = {}
+_saver_started = False
+
+
+def _cache_clear():
+    global _bank_version, _cache_dirty
+    with _cache_lock:
+        _bank_version += 1
+        _cache_dirty = False
+        _result_cache.clear()
+        _url_cache.clear()
+
+
+def _cache_version() -> int:
+    with _cache_lock:
+        return _bank_version
+
+
+def _cache_get(digest: str):
+    with _cache_lock:
+        res = _result_cache.get(digest)
+        if res is not None:
+            _result_cache.move_to_end(digest)
+        return res
+
+
+def _cache_get_by_url(url: str):
+    with _cache_lock:
+        digest = _url_cache.get(url)
+        if digest is None:
+            return None
+        res = _result_cache.get(digest)
+        if res is not None:
+            _result_cache.move_to_end(digest)
+            _url_cache.move_to_end(url)
+        return res
+
+
+def _cache_put(digest: str, result: tuple, version: int, url: Optional[str] = None):
+    global _cache_dirty
+    if CACHE_SIZE <= 0:
+        return
+    with _cache_lock:
+        if version != _bank_version:
+            return
+        _cache_dirty = True
+        _result_cache[digest] = result
+        _result_cache.move_to_end(digest)
+        while len(_result_cache) > CACHE_SIZE:
+            _result_cache.popitem(last=False)
+        if url:
+            _url_cache[url] = digest
+            _url_cache.move_to_end(url)
+            while len(_url_cache) > CACHE_SIZE:
+                _url_cache.popitem(last=False)
+
+
+async def _in_executor(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_executor, fn, *args)
+
+
+def _bank_fingerprint():
+    """Identifies the exact model + feature bank a cached result was computed against."""
+    with _bank_lock:
+        rows = int(_matrix.shape[0])
+        total = round(float(_matrix.sum(dtype=np.float64)), 4)
+    try:
+        model_size = os.path.getsize(BOT_MODEL_PATH)
+    except OSError:
+        model_size = -1
+    return (rows, total, model_size)
+
+
+def _cache_save():
+    global _cache_dirty
+    if not CACHE_FILE or CACHE_SIZE <= 0:
+        return
+    version = _cache_version()
+    fingerprint = _bank_fingerprint()  # taken outside _cache_lock (lock order: bank -> cache)
+    with _cache_lock:
+        if not _cache_dirty or version != _bank_version:
+            return
+        payload = {"fp": fingerprint, "results": list(_result_cache.items()), "urls": list(_url_cache.items())}
+        _cache_dirty = False
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, CACHE_FILE)
+
+
+def _cache_load():
+    if not CACHE_FILE or CACHE_SIZE <= 0 or not os.path.exists(CACHE_FILE):
+        return
+    try:
+        with open(CACHE_FILE, "rb") as f:
+            payload = pickle.load(f)
+        if payload.get("fp") != _bank_fingerprint():
+            log.info("🗂️  Saved spawn cache doesn't match the current model/bank — ignoring it")
+            return
+        with _cache_lock:
+            for key, val in payload["results"][-CACHE_SIZE:]:
+                _result_cache[key] = val
+            for url, digest in payload["urls"][-CACHE_SIZE:]:
+                if digest in _result_cache:
+                    _url_cache[url] = digest
+            n = len(_result_cache)
+        log.info(f"🗂️  Loaded {n} cached spawn results from {CACHE_FILE}")
+    except Exception as e:
+        log.warning(f"Couldn't load spawn cache ({type(e).__name__}: {e}) — starting empty")
+
+
+async def _cache_saver():
+    while True:
+        await asyncio.sleep(CACHE_SAVE_INTERVAL)
+        try:
+            await asyncio.to_thread(_cache_save)
+        except Exception as e:
+            log.warning(f"Couldn't save spawn cache ({type(e).__name__}: {e})")
+
+
+async def _coalesced(table: Dict[str, dict], key: str, received: float, work, deps=None):
+    """Run work(entry) once per key at a time; concurrent callers with the same key share its result."""
+    entry = table.get(key)
+    if entry is not None:
+        entry["latest"] = max(entry["latest"], received)
+        _stats["coalesced"] += 1
+        return await asyncio.shield(entry["fut"])
+    entry = {"fut": asyncio.get_running_loop().create_future(), "latest": received, "deps": list(deps or [])}
+    table[key] = entry
+    result = None
+    try:
+        result = await work(entry)
+    except Exception as e:
+        log.error(f"Identification failed: {type(e).__name__}: {e}")
+    finally:
+        table.pop(key, None)
+        if not entry["fut"].done():
+            entry["fut"].set_result(result)
+    return result
+
+
+def _entry_latest(entry: dict) -> float:
+    latest = entry["latest"]
+    for dep in entry.get("deps", ()):
+        latest = max(latest, _entry_latest(dep))
+    return latest
+
+
+async def _identify_spawn(url: str, received: float):
+    """Returns (winner, score, neighbors, query_vec) or None. Cache -> coalesce -> download -> hash -> infer."""
+    res = _cache_get_by_url(url)
+    if res is not None:
+        _stats["hits"] += 1
+        return res
+
+    async def work(url_entry):
+        image_bytes = await _download(url)
+        if not image_bytes:
+            return None
+        digest = hashlib.sha1(image_bytes).hexdigest()
+        version = _cache_version()
+        res = _cache_get(digest)
+        if res is not None:
+            _stats["hits"] += 1
+            _cache_put(digest, res, version, url)
+            return res
+
+        async def infer(digest_entry):
+            out = await _in_executor(_run_identification_guarded, image_bytes, digest_entry)
+            if out is not None:
+                _stats["misses"] += 1
+            return out
+
+        res = await _coalesced(_inflight_digest, digest, received, infer, deps=[url_entry])
+        if res is not None:
+            _cache_put(digest, res, version, url)
+        return res
+
+    return await _coalesced(_inflight_url, url, received, work)
+
 
 def _load_model_and_bank():
     global _extractor, _species_list, _matrix, _db
@@ -162,6 +382,7 @@ def _load_model_and_bank():
     with _bank_lock:
         old_db = _db
         _extractor, _db, _species_list, _matrix = extractor, new_db, species_list, matrix
+    _cache_clear()
     if old_db is not None:
         old_db.close()
     log.info(f"   Loaded {matrix.shape[0]} feature vectors across {len(set(species_list))} species")
@@ -239,6 +460,14 @@ def _run_identification(image_bytes: bytes):
     query_vec = _embed_image_bytes(image_bytes)
     winner, score, neighbors = _predict(query_vec, species_list, matrix)
     return winner, score, neighbors, query_vec
+
+
+def _run_identification_guarded(image_bytes: bytes, entry: dict):
+    """Worker-thread entry for live spawns: skips jobs that waited too long to still be useful."""
+    if time.time() - _entry_latest(entry) > MAX_SPAWN_AGE:
+        _stats["dropped"] += 1
+        return None
+    return _run_identification(image_bytes)
 
 
 # ── Learning ─────────────────────────────────────────────────────────────
@@ -328,6 +557,7 @@ def _learn_sync(name: str, vec: np.ndarray, allow_new: bool = False):
         _db_insert_learned(species, vec)  # DB first, so memory never gets ahead of it
         _matrix = np.vstack([_matrix, vec[None, :]])
         _species_list = _species_list + [species]
+        _cache_clear()
         return "learned", species, sum(1 for s in _species_list if s == species)
 
 
@@ -359,6 +589,7 @@ def _delete_learned(species: Optional[str] = None, last_only: bool = False):
                 pass
         if rows:
             _species_list, _matrix = load_feature_bank(_db)
+            _cache_clear()
         return [sp for _, sp in rows]
 
 
@@ -422,7 +653,11 @@ async def _maybe_auto_learn(message: discord.Message):
 
 @bot.event
 async def on_ready():
+    global _saver_started
     await _get_session()
+    if CACHE_FILE and CACHE_SIZE > 0 and not _saver_started:
+        _saver_started = True
+        asyncio.create_task(_cache_saver())
     log.info("=" * 60)
     log.info(f"🤖 Logged in as {bot.user} — scanning for spawns from bot ID {SPAWN_BOT_ID}")
     log.info(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}")
@@ -447,25 +682,27 @@ async def on_message(message: discord.Message):
     if not image_url:
         return
 
+    received = time.time()
+    cid = message.channel.id
+    gen = _spawn_gen.get(cid, 0) + 1
+    _spawn_gen[cid] = gen  # a newer spawn in this channel supersedes this one if it's still working
+
     # A new spawn replaces the old one, so forget the previous spawn now; it's
     # only re-set below if we manage to analyse this one (avoids learning a
     # catch against the wrong image).
-    _last_spawn[message.channel.id] = None
+    _last_spawn[cid] = None
 
-    start = time.time()
-    image_bytes = await _download(image_url)
-    if not image_bytes:
+    result = await _identify_spawn(image_url, received)
+    if result is None:
         return
+    if _spawn_gen.get(cid) != gen:
+        return  # superseded while we were working
 
-    try:
-        winner, score, neighbors, query_vec = await asyncio.to_thread(_run_identification, image_bytes)
-    except Exception as e:
-        log.error(f"Inference failed for spawn message {message.id}: {e}")
-        return
+    winner, score, neighbors, query_vec = result
 
     _last_spawn[message.channel.id] = (time.time(), winner, score, query_vec)
 
-    elapsed_ms = (time.time() - start) * 1000
+    elapsed_ms = (time.time() - received) * 1000
     confident = score >= CONFIDENCE_THRESHOLD
     log.info(f"Spawn {message.id}: {winner} (score {score:.3f}, confident={confident}, {elapsed_ms:.0f}ms)")
 
@@ -525,7 +762,7 @@ async def predict_cmd(ctx: commands.Context):
         return
 
     start = time.time()
-    winner, score, neighbors, _ = await asyncio.to_thread(_run_identification, image_bytes)
+    winner, score, neighbors, _ = await _in_executor(_run_identification, image_bytes)
     elapsed_ms = (time.time() - start) * 1000
 
     lines = [f"**Best guess:** {_display(winner)} — {score * 100:.1f}%"]
@@ -626,6 +863,9 @@ async def stats_cmd(ctx: commands.Context):
         f"📊 Loaded **{matrix.shape[0]}** feature vectors across "
         f"**{len(set(species_list))}** species from the DB "
         f"(**{learned}** taught by you).\n"
+        f"Cache: `{len(_result_cache)}` results · hits `{_stats['hits']}` · inferences `{_stats['misses']}` · "
+        f"shared `{_stats['coalesced']}` · dropped `{_stats['dropped']}`\n"
+        f"Workers: `{INFER_WORKERS}` · torch threads: `{TORCH_THREADS}`\n"
         f"Model: `{BOT_MODEL_PATH}`\n"
         f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` · Auto-learn: `{'on' if AUTO_LEARN else 'off'}`"
     )
@@ -659,6 +899,7 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
 
 def main():
     _load_model_and_bank()
+    _cache_load()
     bot.run(DISCORD_TOKEN, log_handler=None)  # we configured logging above (stdout)
 
 
