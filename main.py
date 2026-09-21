@@ -54,8 +54,11 @@ answer comes from is set by AUTO_LEARN_SOURCE:
 See .env.example for all auto-learn variables.
 """
 
+import io
 import os
 import re
+import atexit
+import signal
 import sys
 import json
 import time
@@ -65,11 +68,17 @@ import asyncio
 import logging
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+try:  # optional: shrinks uploads. Without Pillow the original image is sent (same results, bigger upload)
+    from PIL import Image as _PILImage
+except ImportError:
+    _PILImage = None
 
 load_dotenv()
 
@@ -104,7 +113,7 @@ if not AI_MODEL_API_URL:
     )
 # Only needed if the AI_Model server was started with API_KEY set.
 AI_MODEL_API_KEY = os.getenv("AI_MODEL_API_KEY", "")
-AI_MODEL_TIMEOUT = float(os.getenv("AI_MODEL_TIMEOUT", "20"))
+AI_MODEL_TIMEOUT = 20.0
 
 # Default is Poketwo's real bot ID, since that's the most common spawn
 # source. Override via .env if you're scanning a different spawn bot.
@@ -125,28 +134,31 @@ SILENT_BELOW_THRESHOLD = os.getenv("SILENT_BELOW_THRESHOLD", "false").lower() ==
 # Micro-batching: each worker groups up to BATCH_MAX queued images into one
 # /v1/predict/batch call, waiting at most BATCH_WAIT_MS for stragglers (0 =
 # only group what's already waiting, so it never adds latency).
-BATCH_MAX = max(1, int(os.getenv("BATCH_MAX", "4")))
-BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "0")))
+BATCH_MAX = 8
+BATCH_WAIT_MS = 0.0
 # How many /v1/predict(/batch) calls this bot will have in flight at once.
-API_CONCURRENCY = max(1, int(os.getenv("API_CONCURRENCY", "4")))
+API_CONCURRENCY = 32
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
 # would arrive too late to be useful, and skipping lets the queue catch up.
-MAX_SPAWN_AGE = float(os.getenv("MAX_SPAWN_AGE", "15"))
+MAX_SPAWN_AGE = 15.0
 # Max cached image results (LRU). Same image bytes/URL -> no API call at all.
-CACHE_SIZE = max(0, int(os.getenv("CACHE_SIZE", "5000")))
+CACHE_SIZE = 5000
 # Cache is saved here every CACHE_SAVE_INTERVAL seconds and re-loaded on start
 # (only if the API's feature bank is unchanged since), so restarts don't need
 # a warm-up. Set CACHE_FILE="" to disable.
-CACHE_FILE = os.getenv("CACHE_FILE", "spawn_cache.pkl")
+CACHE_FILE = "spawn_cache.pkl"
 # Also skip the download when the same image URL was seen before. Off by default: results are
 # always cached by the image's exact bytes (provably identical input -> identical answer), a
 # URL match is only an assumption that the URL always serves the same image.
-URL_CACHE = os.getenv("URL_CACHE", "false").lower() == "true"
-CACHE_SAVE_INTERVAL = float(os.getenv("CACHE_SAVE_INTERVAL", "60"))
+URL_CACHE = True
+# Send the image URL to the API and let the SERVER download it (no download + upload through the bot).
+# Falls back to the download+upload path per spawn if the server can't fetch that URL.
+URL_MODE = True
+CACHE_SAVE_INTERVAL = 15.0
 # s!api dashboard: rolling window for timing stats, and how recently a channel
 # must have spawned to count as an "active incense" channel.
-METRICS_WINDOW = float(os.getenv("METRICS_WINDOW", "300"))
-ACTIVE_INCENSE_WINDOW = float(os.getenv("ACTIVE_INCENSE_WINDOW", "60"))
+METRICS_WINDOW = 300.0
+ACTIVE_INCENSE_WINDOW = 60.0
 
 # ---- Auto-learning (opt-in) ------------------------------------------------
 AUTO_LEARN = os.getenv("AUTO_LEARN", "false").lower() == "true"
@@ -192,6 +204,24 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+
+def _shrink_for_upload(data: bytes) -> bytes:
+    """
+    Resize to the model's 224x224 input here (same PIL convert("RGB") + BILINEAR resize the server does)
+    and send it as lossless PNG. The server's own resize is then a no-op, so embeddings and answers are
+    bit-identical, but the upload is several times smaller. Falls back to the original bytes on any problem.
+    """
+    if _PILImage is None:
+        return data
+    try:
+        im = _PILImage.open(io.BytesIO(data)).convert("RGB").resize((224, 224), _PILImage.Resampling.BILINEAR)
+        out = io.BytesIO()
+        im.save(out, "PNG", compress_level=1)
+        small = out.getvalue()
+        return small if len(small) < len(data) else data
+    except Exception:
+        return data
+
 
 # ---- HTTP session + AI_Model API client ------------------------------------
 _session: Optional[aiohttp.ClientSession] = None
@@ -285,6 +315,20 @@ async def api_predict_batch(images_bytes: List[bytes], *, threshold: Optional[fl
     return out
 
 
+async def api_predict_urls(urls: List[str], *, threshold: Optional[float] = None,
+                           include_embedding: bool = False) -> List[dict]:
+    params = {}
+    if threshold is not None:
+        params["threshold"] = str(threshold)
+    if include_embedding:
+        params["include_embedding"] = "true"
+    body = await _api_request("POST", "/v1/predict/urls", json={"urls": urls}, params=params)
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list) or len(results) != len(urls):
+        raise ApiError(200, f"unexpected /v1/predict/urls response: {json.dumps(body)[:300]}")
+    return results
+
+
 async def api_learn(species: str, *, allow_new: bool = False,
                      file_bytes: Optional[bytes] = None,
                      embedding: Optional[List[float]] = None) -> dict:
@@ -330,15 +374,29 @@ async def _download(url: str) -> Optional[bytes]:
 # something, or someone else did via the API) the cache is stale and gets
 # dropped - there's no local feature matrix to fingerprint anymore.
 _known_bank_version: Optional[int] = None
+_known_bank_fp: Optional[str] = None   # content fingerprint of the API's bank (None = unknown -> don't save the cache)
 
 
 async def _note_bank_version(version: Optional[int]):
-    global _known_bank_version
+    global _known_bank_version, _known_bank_fp
     if version is None:
         return
     if _known_bank_version is not None and version != _known_bank_version:
         await _cache_clear()
+        _known_bank_fp = None            # bank changed: cache content is new; learn the new fingerprint
+        asyncio.create_task(_refresh_bank_fp())
     _known_bank_version = version
+
+
+async def _refresh_bank_fp():
+    """Fetch the bank fingerprint after a bank change (only trusted if the version still matches)."""
+    global _known_bank_fp
+    try:
+        h = await api_health()
+        if h.get("bank_version") == _known_bank_version:
+            _known_bank_fp = h.get("bank_fingerprint")
+    except Exception:
+        pass
 
 
 # ---- Result cache (by image hash) ------------------------------------------
@@ -396,9 +454,9 @@ async def _cache_put(digest: str, result: tuple, url: Optional[str] = None):
 
 def _cache_save():
     global _cache_dirty
-    if not CACHE_FILE or CACHE_SIZE <= 0 or not _cache_dirty:
+    if not CACHE_FILE or CACHE_SIZE <= 0 or not _cache_dirty or not _known_bank_fp:
         return
-    payload = {"fp": _known_bank_version, "results": list(_result_cache.items()), "urls": list(_url_cache.items())}
+    payload = {"fp": _known_bank_fp, "results": list(_result_cache.items()), "urls": list(_url_cache.items())}
     _cache_dirty = False
     tmp = CACHE_FILE + ".tmp"
     with open(tmp, "wb") as f:
@@ -412,7 +470,7 @@ def _cache_load():
     try:
         with open(CACHE_FILE, "rb") as f:
             payload = pickle.load(f)
-        if payload.get("fp") != _known_bank_version:
+        if not _known_bank_fp or payload.get("fp") != _known_bank_fp:
             log.info("Saved spawn cache doesn't match the API's current feature bank - ignoring it")
             return
         for key, val in payload["results"][-CACHE_SIZE:]:
@@ -583,12 +641,17 @@ async def _identify_one(image_bytes: bytes) -> Optional[tuple]:
     return _result_from_predict(data)
 
 
-async def _identify_batch(images_bytes: List[bytes]) -> List[Optional[tuple]]:
+async def _identify_batch(images_bytes: List[bytes], info: Optional[dict] = None) -> List[Optional[tuple]]:
+    t_api = time.perf_counter()
     try:
         results = await api_predict_batch(images_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN)
     except Exception as e:
         log.error(f"Batch predict API error ({type(e).__name__}): {e}")
         return [None] * len(images_bytes)
+    if info is not None:
+        info["api"] = (time.perf_counter() - t_api) * 1000
+        info["srv"] = sum((r.get("timing_ms", {}).get("embed", 0.0) + r.get("timing_ms", {}).get("match", 0.0))
+                          for r in results if r) / max(1, sum(1 for r in results if r))
     out = []
     for r in results:
         if r is None:
@@ -636,17 +699,25 @@ async def _batch_worker():
                 _stats["dropped"] += 1
                 fut.set_result(None)
                 continue
-            live.append((image_bytes, fut))
+            live.append((image_bytes, fut, entry))
         if not live:
             continue
         try:
-            results = await _identify_batch([b for b, _ in live])
+            now_pc = time.perf_counter()
+            info = {"n": len(live)}
+            for _, _, e in live:
+                if e is not None:
+                    e["t_queue"] = (now_pc - e.get("t_put", now_pc)) * 1000
+            results = await _identify_batch([b for b, _, _ in live], info)
+            for _, _, e in live:
+                if e is not None:
+                    e.update(info)
         except Exception as e:
             log.error(f"Batch inference failed: {type(e).__name__}: {e}")
             results = [None] * len(live)
         _stats["batches"] += 1
         _stats["batch_items"] += len(live)
-        for (_, fut), res in zip(live, results):
+        for (_, fut, _), res in zip(live, results):
             if not fut.done():
                 fut.set_result(res)
 
@@ -658,8 +729,54 @@ async def _submit_identification(image_bytes: bytes, entry: dict):
         _batch_queue = asyncio.Queue()
         _batch_tasks.extend(asyncio.create_task(_batch_worker()) for _ in range(API_CONCURRENCY))
     fut = asyncio.get_running_loop().create_future()
+    if entry is not None:
+        entry["t_put"] = time.perf_counter()
     _batch_queue.put_nowait((image_bytes, entry, fut))
     return await fut
+
+
+_url_blocked_hosts: set = set()   # hosts the server refuses to fetch -> use download+upload for these
+
+
+def _url_host(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+async def _identify_via_server_fetch(url: str, timing: Optional[dict]):
+    """The server downloads + identifies. Returns (result_tuple, sha1) or None (caller falls back)."""
+    global URL_MODE
+    host = _url_host(url)
+    t = time.perf_counter()
+    try:
+        r = (await api_predict_urls([url], threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN))[0]
+    except ApiError as e:
+        if e.status in (404, 405):  # server too old to have /v1/predict/urls
+            log.warning("API has no /v1/predict/urls - switching to download+upload mode")
+            URL_MODE = False
+        else:
+            log.warning(f"URL predict API error: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"URL predict unreachable ({type(e).__name__}): {e}")
+        return None
+    api_ms = (time.perf_counter() - t) * 1000
+    if not r.get("ok"):
+        if r.get("code") == "host_not_allowed" and host:
+            _url_blocked_hosts.add(host)
+            log.info(f"API won't fetch from {host}; using download+upload for that host")
+        return None
+    await _note_bank_version(r.get("bank_version"))
+    tm = r.get("timing_ms", {})
+    _m_add(_m_inference, tm.get("embed", 0.0))
+    _m_add(_m_store, tm.get("match", 0.0))
+    if timing is not None:
+        timing["api"] = api_ms
+        timing["srv"] = tm.get("embed", 0.0) + tm.get("match", 0.0)
+        timing["fetch"] = r.get("fetch_ms", 0.0)
+    return _result_from_predict(r), r.get("sha1")
 
 
 _inflight_url: Dict[str, dict] = {}
@@ -693,7 +810,7 @@ async def _coalesced(table: Dict[str, dict], key: str, received: float, work, de
     return await entry["fut"]
 
 
-async def _identify_spawn(url: str, received: float):
+async def _identify_spawn(url: str, received: float, timing: Optional[dict] = None):
     """Returns (winner, score, neighbors, embedding) or None. Cache -> coalesce -> download -> hash -> infer."""
     res = await _cache_get_by_url(url) if URL_CACHE else None
     if res is not None:
@@ -702,7 +819,20 @@ async def _identify_spawn(url: str, received: float):
     cache_url = url if URL_CACHE else None
 
     async def work(url_entry):
+        if URL_MODE and _url_host(url) not in _url_blocked_hosts:
+            got = await _identify_via_server_fetch(url, timing)
+            if got is not None:
+                res, digest = got
+                _stats["misses"] += 1
+                if digest:
+                    await _cache_put(digest, res, cache_url)
+                return res
+            if timing is not None:
+                timing.pop("api", None)  # failed attempt: don't mix its numbers into the fallback's
+        t_dl = time.perf_counter()
         image_bytes = await _download(url)
+        if timing is not None:
+            timing["dl"] = (time.perf_counter() - t_dl) * 1000
         if not image_bytes:
             return None
         digest = hashlib.sha1(image_bytes).hexdigest()
@@ -713,7 +843,14 @@ async def _identify_spawn(url: str, received: float):
             return res
 
         async def infer(digest_entry):
-            out = await _submit_identification(image_bytes, digest_entry)
+            small = await asyncio.get_running_loop().run_in_executor(None, _shrink_for_upload, image_bytes)
+            if timing is not None:
+                timing["kb"] = len(small) / 1024
+            out = await _submit_identification(small, digest_entry)
+            if timing is not None:
+                for k in ("t_queue", "api", "srv", "n"):
+                    if k in digest_entry:
+                        timing[k] = digest_entry[k]
             if out is not None:
                 _stats["misses"] += 1
             return out
@@ -870,12 +1007,13 @@ _saver_started = False
 
 @bot.event
 async def on_ready():
-    global _saver_started, _known_bank_version
+    global _saver_started, _known_bank_version, _known_bank_fp
     await _get_session()
 
     try:
         health = await api_health()
         _known_bank_version = health.get("bank_version")
+        _known_bank_fp = health.get("bank_fingerprint")
         log.info(f"Connected to AI_Model API: {AI_MODEL_API_URL}")
         log.info(f"   ready={health.get('ready')} backend={health.get('backend')} "
                  f"vectors={health.get('vectors')} species={health.get('species')}")
@@ -938,7 +1076,8 @@ async def on_message(message: discord.Message):
     # catch against the wrong image).
     _last_spawn[cid] = None
 
-    result = await _identify_spawn(image_url, received)
+    timing: dict = {}
+    result = await _identify_spawn(image_url, received, timing)
     if result is None:
         return
     if _spawn_gen.get(cid) != gen:
@@ -950,7 +1089,19 @@ async def on_message(message: discord.Message):
 
     elapsed_ms = (time.time() - received) * 1000
     confident = score >= CONFIDENCE_THRESHOLD
-    log.info(f"Spawn {message.id}: {winner} (score {score:.3f}, confident={confident}, {elapsed_ms:.0f}ms)")
+    parts = []
+    if "dl" in timing:
+        parts.append(f"dl {timing['dl']:.0f}")
+    if "t_queue" in timing:
+        parts.append(f"queue {timing['t_queue']:.0f}")
+    if "api" in timing:
+        fetch = f", fetch {timing['fetch']:.0f}" if "fetch" in timing else ""
+        parts.append(f"api {timing['api']:.0f} (srv {timing.get('srv', 0):.0f}{fetch})")
+    if "n" in timing:
+        parts.append(f"batch {timing['n']}")
+    parts.append("server-fetch" if "fetch" in timing else (f"up {timing['kb']:.0f}KB" if "kb" in timing else "cached"))
+    detail = " [" + " | ".join(parts) + "]"
+    log.info(f"Spawn {message.id}: {winner} (score {score:.3f}, confident={confident}, {elapsed_ms:.0f}ms){detail}")
 
     if not confident and SILENT_BELOW_THRESHOLD:
         return
@@ -1161,7 +1312,7 @@ async def stats_cmd(ctx: commands.Context):
 @commands.is_owner()
 async def reload_cmd(ctx: commands.Context):
     """Ask the AI_Model API to re-load its model + feature bank (use after retraining)."""
-    global _known_bank_version
+    global _known_bank_version, _known_bank_fp
     await ctx.send("Asking the API to reload its model + feature bank ...")
     try:
         result = await api_reload()
@@ -1175,6 +1326,7 @@ async def reload_cmd(ctx: commands.Context):
     try:
         health = await api_health()
         _known_bank_version = health.get("bank_version")
+        _known_bank_fp = health.get("bank_fingerprint")
     except Exception:
         pass
     await ctx.send(
@@ -1195,7 +1347,16 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
     await ctx.send(f"Confidence threshold set to `{CONFIDENCE_THRESHOLD}` (sent to the API on every prediction).")
 
 
+def _on_sigterm(signum, frame):
+    raise SystemExit(0)  # unwinds bot.run() so the atexit cache save runs on a panel "stop"
+
+
 def main():
+    atexit.register(_cache_save)  # don't lose the last few seconds of cache on a restart/stop
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass
     bot.run(DISCORD_TOKEN, log_handler=None)  # we configured logging above (stdout)
 
 
