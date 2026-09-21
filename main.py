@@ -39,6 +39,7 @@ import os
 import io
 import re
 import sys
+import gc
 import json
 import time
 import pickle
@@ -61,6 +62,7 @@ from PIL import Image
 from dotenv import load_dotenv
 
 from predict import load_extractor, load_feature_bank, predict_species
+from onnx_backend import OnnxExtractor, onnx_matches_source
 from train_model import Database, MODEL_OUTPUT
 
 load_dotenv()
@@ -128,6 +130,18 @@ LEARN_DUP_SIM = float(os.getenv("LEARN_DUP_SIM", "0.995"))
 # os.cpu_count() on Railway & co. reports the HOST's cores, not your quota, so
 # torch's default thread count badly oversubscribes a 1 vCPU plan. Defaults
 # below are for 1 vCPU; on N vCPU set INFER_WORKERS=N (keep TORCH_THREADS=1).
+# BACKEND: "auto" = ONNX Runtime if it works (exported from the same .pt), else PyTorch;
+# "onnx" = ONNX or refuse to start; "torch" = always PyTorch. With AUTO_EXPORT_ONNX the
+# .onnx is (re)built on startup whenever it's missing or was made from a different .pt.
+BACKEND = os.getenv("BACKEND", "auto").lower()
+ONNX_MODEL_PATH = os.getenv("ONNX_MODEL_PATH") or os.path.splitext(BOT_MODEL_PATH)[0] + ".onnx"
+AUTO_EXPORT_ONNX = os.getenv("AUTO_EXPORT_ONNX", "true").lower() == "true"
+# Micro-batching: each worker groups up to BATCH_MAX queued images into one model call,
+# waiting at most BATCH_WAIT_MS for stragglers (0 = only group what's already waiting, so
+# it never adds latency). Measured on 1 thread it gave no speedup, so it's off (1) by default;
+# try BATCH_MAX=4..8 on multi-core hosts and compare inference time in s!api.
+BATCH_MAX = max(1, int(os.getenv("BATCH_MAX", "1")))
+BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "0")))
 INFER_WORKERS = max(1, int(os.getenv("INFER_WORKERS", "1")))
 TORCH_THREADS = max(1, int(os.getenv("TORCH_THREADS", "1")))
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
@@ -191,7 +205,8 @@ _cache_lock = threading.Lock()
 _result_cache: "OrderedDict[str, tuple]" = OrderedDict()   # sha1(image bytes) -> result tuple
 _url_cache: "OrderedDict[str, str]" = OrderedDict()        # image url -> sha1
 _bank_version = 0
-_stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0}
+_stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0, "batches": 0, "batch_items": 0}
+_backend_name = "PyTorch CPU"
 _cache_dirty = False
 # In-flight work, so N channels spawning the same image at once cost ONE download/inference.
 _inflight_url: Dict[str, dict] = {}
@@ -348,8 +363,9 @@ def _build_api_embed() -> discord.Embed:
     field("Response Latest", _fmt_ms(r_last))
     field("Pokémons Named", f"{d['named']:,}")
     embed.set_footer(
-        text=f"Model: {os.path.basename(BOT_MODEL_PATH)} | Backend: PyTorch CPU "
-             f"(threads={TORCH_THREADS}, workers={INFER_WORKERS}) | Window: {METRICS_WINDOW / 60:g} min rolling"
+        text=f"Model: {os.path.basename(BOT_MODEL_PATH)} | Backend: {_backend_name} "
+             f"(threads={TORCH_THREADS}, workers={INFER_WORKERS}, batch≤{BATCH_MAX}) | "
+             f"Window: {METRICS_WINDOW / 60:g} min rolling"
     )
     return embed
 
@@ -461,7 +477,7 @@ async def _identify_spawn(url: str, received: float):
             return res
 
         async def infer(digest_entry):
-            out = await _in_executor(_run_identification_guarded, image_bytes, digest_entry)
+            out = await _submit_identification(image_bytes, digest_entry)
             if out is not None:
                 _stats["misses"] += 1
             return out
@@ -474,10 +490,52 @@ async def _identify_spawn(url: str, received: float):
     return await _coalesced(_inflight_url, url, received, work)
 
 
+def _try_onnx():
+    """Returns an OnnxExtractor that matches BOT_MODEL_PATH, or None (caller falls back to PyTorch)."""
+    global _backend_name
+    try:
+        state = onnx_matches_source(ONNX_MODEL_PATH, BOT_MODEL_PATH)  # True / False / None (no sidecar)
+        exists = os.path.exists(ONNX_MODEL_PATH)
+        if not exists or state is False:
+            if not AUTO_EXPORT_ONNX:
+                log.warning(f"ONNX model {'is stale' if exists else 'not found'} and AUTO_EXPORT_ONNX is off")
+                return None
+            log.info("🔧 Exporting ONNX model (one-time, ~10-30s) ...")
+            from export_onnx import export_to_onnx
+            torch_ex = load_extractor(BOT_MODEL_PATH)
+            stats = export_to_onnx(torch_ex, ONNX_MODEL_PATH, BOT_MODEL_PATH)
+            log.info(f"   ✅ ONNX verified vs PyTorch (min cosine {stats['min_cos']:.6f})")
+            del torch_ex
+            gc.collect()
+        elif state is None:
+            log.warning("ONNX model has no metadata sidecar — can't confirm it matches the .pt")
+        ex = OnnxExtractor(ONNX_MODEL_PATH, threads=TORCH_THREADS)
+        _backend_name = "ONNX Runtime"
+        return ex
+    except Exception as e:
+        log.warning(f"ONNX backend unavailable ({type(e).__name__}: {e})")
+        return None
+
+
+def _load_extractor():
+    global _backend_name
+    mode = BACKEND if BACKEND in ("auto", "onnx", "torch") else "auto"
+    if mode != "torch":
+        ex = _try_onnx()
+        if ex is not None:
+            return ex
+        if mode == "onnx":
+            raise SystemExit("❌ BACKEND=onnx but the ONNX model couldn't be loaded (see the warning above).")
+        log.info("   Falling back to PyTorch")
+    _backend_name = "PyTorch CPU"
+    return load_extractor(BOT_MODEL_PATH)
+
+
 def _load_model_and_bank():
     global _extractor, _species_list, _matrix, _db
     log.info(f"📦 Loading model from {BOT_MODEL_PATH} ...")
-    extractor = load_extractor(BOT_MODEL_PATH)
+    extractor = _load_extractor()
+    log.info(f"   Backend: {_backend_name}")
 
     log.info("🗄️  Connecting to database and loading feature bank ...")
     new_db = Database()
@@ -571,12 +629,91 @@ def _run_identification(image_bytes: bytes):
     return winner, score, neighbors, query_vec
 
 
-def _run_identification_guarded(image_bytes: bytes, entry: dict):
-    """Worker-thread entry for live spawns: skips jobs that waited too long to still be useful."""
-    if time.time() - _entry_latest(entry) > MAX_SPAWN_AGE:
-        _stats["dropped"] += 1
-        return None
-    return _run_identification(image_bytes)
+def _run_identification_batch(images_bytes):
+    """Worker thread: embed a group of images in one model call, then match each. None = unreadable image."""
+    extractor, species_list, matrix = _snapshot()
+    imgs = []
+    for b in images_bytes:
+        try:
+            imgs.append(Image.open(io.BytesIO(b)).convert("RGB"))
+        except Exception:
+            imgs.append(None)
+    n_valid = sum(1 for im in imgs if im is not None)
+    t0 = time.perf_counter()
+    if isinstance(extractor, OnnxExtractor):
+        vecs = extractor.extract_batch(imgs)  # row i always belongs to imgs[i]
+    else:  # PyTorch fallback: one image at a time (its extract_batch can misalign on failures)
+        vecs = [extractor.extract(im) if im is not None else None for im in imgs]
+    per_image_ms = (time.perf_counter() - t0) * 1000 / max(1, n_valid)
+
+    results = []
+    for im, vec in zip(imgs, vecs):
+        if im is None or vec is None or float(np.linalg.norm(vec)) < 1e-6:
+            results.append(None)
+            continue
+        t1 = time.perf_counter()
+        winner, score, neighbors = _predict(vec, species_list, matrix)
+        _m_add(_m_store, (time.perf_counter() - t1) * 1000)
+        _m_add(_m_inference, per_image_ms)
+        results.append((winner, score, neighbors, vec))
+    return results
+
+
+_batch_queue: Optional[asyncio.Queue] = None
+_batch_tasks = []
+
+
+async def _batch_worker():
+    loop = asyncio.get_running_loop()
+    while True:
+        batch = [await _batch_queue.get()]
+        deadline = loop.time() + BATCH_WAIT_MS / 1000.0
+        while len(batch) < BATCH_MAX:
+            try:
+                batch.append(_batch_queue.get_nowait())
+                continue
+            except asyncio.QueueEmpty:
+                pass
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(_batch_queue.get(), remaining))
+            except asyncio.TimeoutError:
+                break
+
+        live = []
+        for image_bytes, entry, fut in batch:
+            if fut.done():
+                continue
+            if time.time() - _entry_latest(entry) > MAX_SPAWN_AGE:  # too old to be useful
+                _stats["dropped"] += 1
+                fut.set_result(None)
+                continue
+            live.append((image_bytes, fut))
+        if not live:
+            continue
+        try:
+            results = await loop.run_in_executor(_executor, _run_identification_batch, [b for b, _ in live])
+        except Exception as e:
+            log.error(f"Batch inference failed: {type(e).__name__}: {e}")
+            results = [None] * len(live)
+        _stats["batches"] += 1
+        _stats["batch_items"] += len(live)
+        for (_, fut), res in zip(live, results):
+            if not fut.done():
+                fut.set_result(res)
+
+
+async def _submit_identification(image_bytes: bytes, entry: dict):
+    """Queue an image for the (micro-batching) inference workers; resolves to a result tuple or None."""
+    global _batch_queue
+    if _batch_queue is None:
+        _batch_queue = asyncio.Queue()
+        _batch_tasks.extend(asyncio.create_task(_batch_worker()) for _ in range(INFER_WORKERS))
+    fut = asyncio.get_running_loop().create_future()
+    _batch_queue.put_nowait((image_bytes, entry, fut))
+    return await fut
 
 
 # ── Learning ─────────────────────────────────────────────────────────────
@@ -987,7 +1124,8 @@ async def stats_cmd(ctx: commands.Context):
         f"(**{learned}** taught by you).\n"
         f"Cache: `{len(_result_cache)}` results · hits `{_stats['hits']}` · inferences `{_stats['misses']}` · "
         f"shared `{_stats['coalesced']}` · dropped `{_stats['dropped']}`\n"
-        f"Workers: `{INFER_WORKERS}` · torch threads: `{TORCH_THREADS}`\n"
+        f"Backend: `{_backend_name}` · workers: `{INFER_WORKERS}` · threads: `{TORCH_THREADS}` · "
+        f"avg batch: `{_stats['batch_items'] / max(1, _stats['batches']):.2f}` (max `{BATCH_MAX}`)\n"
         f"Model: `{BOT_MODEL_PATH}`\n"
         f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` · Auto-learn: `{'on' if AUTO_LEARN else 'off'}`"
     )
