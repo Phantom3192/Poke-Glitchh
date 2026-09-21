@@ -25,6 +25,7 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
     s!forget <species>   - remove the examples you taught for that species
     s!undo               - remove the most recent example you taught
     s!stats              - show how many species/features are loaded
+    s!compare            - accuracy check: active backend vs PyTorch on one image
     s!api                - live performance dashboard (activity, active incense,
                            inference/response times, cache hit rate, Pokémon named)
     s!reload             - re-load the model + feature bank from disk/DB
@@ -153,6 +154,10 @@ CACHE_SIZE = max(0, int(os.getenv("CACHE_SIZE", "5000")))
 # (only if the model + feature bank are unchanged), so restarts don't need a
 # warm-up. Set CACHE_FILE="" to disable.
 CACHE_FILE = os.getenv("CACHE_FILE", "spawn_cache.pkl")
+# Also skip the download when the same image URL was seen before. Off by default: results are
+# always cached by the image's exact bytes (provably identical input -> identical answer), a
+# URL match is only an assumption that the URL always serves the same image.
+URL_CACHE = os.getenv("URL_CACHE", "false").lower() == "true"
 CACHE_SAVE_INTERVAL = float(os.getenv("CACHE_SAVE_INTERVAL", "60"))
 # s!api dashboard: rolling window for timing stats, and how recently a channel
 # must have spawned to count as an "active incense" channel.
@@ -459,10 +464,11 @@ def _entry_latest(entry: dict) -> float:
 
 async def _identify_spawn(url: str, received: float):
     """Returns (winner, score, neighbors, query_vec) or None. Cache -> coalesce -> download -> hash -> infer."""
-    res = _cache_get_by_url(url)
+    res = _cache_get_by_url(url) if URL_CACHE else None
     if res is not None:
         _stats["hits"] += 1
         return res
+    cache_url = url if URL_CACHE else None
 
     async def work(url_entry):
         image_bytes = await _download(url)
@@ -473,7 +479,7 @@ async def _identify_spawn(url: str, received: float):
         res = _cache_get(digest)
         if res is not None:
             _stats["hits"] += 1
-            _cache_put(digest, res, version, url)
+            _cache_put(digest, res, version, cache_url)
             return res
 
         async def infer(digest_entry):
@@ -484,7 +490,7 @@ async def _identify_spawn(url: str, received: float):
 
         res = await _coalesced(_inflight_digest, digest, received, infer, deps=[url_entry])
         if res is not None:
-            _cache_put(digest, res, version, url)
+            _cache_put(digest, res, version, cache_url)
         return res
 
     return await _coalesced(_inflight_url, url, received, work)
@@ -496,9 +502,10 @@ def _try_onnx():
     try:
         state = onnx_matches_source(ONNX_MODEL_PATH, BOT_MODEL_PATH)  # True / False / None (no sidecar)
         exists = os.path.exists(ONNX_MODEL_PATH)
-        if not exists or state is False:
+        if not exists or state is not True:  # missing, made from a different .pt, or no sidecar to prove it
             if not AUTO_EXPORT_ONNX:
-                log.warning(f"ONNX model {'is stale' if exists else 'not found'} and AUTO_EXPORT_ONNX is off")
+                why = "can't be matched to the current .pt" if exists else "not found"
+                log.warning(f"ONNX model {why} and AUTO_EXPORT_ONNX is off")
                 return None
             log.info("🔧 Exporting ONNX model (one-time, ~10-30s) ...")
             from export_onnx import export_to_onnx
@@ -507,8 +514,6 @@ def _try_onnx():
             log.info(f"   ✅ ONNX verified vs PyTorch (min cosine {stats['min_cos']:.6f})")
             del torch_ex
             gc.collect()
-        elif state is None:
-            log.warning("ONNX model has no metadata sidecar — can't confirm it matches the .pt")
         ex = OnnxExtractor(ONNX_MODEL_PATH, threads=TORCH_THREADS)
         _backend_name = "ONNX Runtime"
         return ex
@@ -1111,6 +1116,47 @@ async def undo_cmd(ctx: commands.Context):
 async def api_cmd(ctx: commands.Context):
     """Live performance dashboard: activity, active incense, inference/response times, cache hit rate."""
     await ctx.send(embed=_build_api_embed())
+
+
+_torch_reference = None
+
+
+def _compare_sync(image_bytes: bytes):
+    """Embed one image with the active backend AND the PyTorch reference, and match both against the bank."""
+    global _torch_reference
+    extractor, species_list, matrix = _snapshot()
+    if _torch_reference is None:
+        _torch_reference = extractor if not isinstance(extractor, OnnxExtractor) else load_extractor(BOT_MODEL_PATH)
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    v_ref, v_act = _torch_reference.extract(img), extractor.extract(img)
+    cos = float(np.dot(v_ref, v_act) / max(1e-9, float(np.linalg.norm(v_ref) * np.linalg.norm(v_act))))
+    return _predict(v_ref, species_list, matrix), _predict(v_act, species_list, matrix), cos
+
+
+@bot.command(name="compare")
+@commands.is_owner()
+async def compare_cmd(ctx: commands.Context):
+    """Accuracy check: run the active backend and PyTorch on one image (attach it, or reply to it)."""
+    image_bytes, error = await _resolve_message_image(
+        ctx, no_image_error="⚠️ Attach an image, or reply to a message that has one, when using this command."
+    )
+    if image_bytes is None:
+        await ctx.send(error)
+        return
+    async with ctx.typing():
+        (w_ref, s_ref, n_ref), (w_act, s_act, n_act), cos = await _in_executor(_compare_sync, image_bytes)
+    same = w_ref == w_act
+    lines = [
+        f"**Active backend ({_backend_name}):** {_display(w_act)} — {s_act * 100:.2f}%",
+        f"**PyTorch reference:** {_display(w_ref)} — {s_ref * 100:.2f}%",
+        f"**Embedding cosine (1.0 = identical):** {cos:.7f}",
+        f"**Same answer:** {'✅ yes' if same else '❌ NO'}",
+        "", "**Top matches (active):** " + ", ".join(f"{_display(sp)} {sim * 100:.1f}%" for sp, sim in n_act[:3]),
+    ]
+    await ctx.send(embed=discord.Embed(
+        title="🔬 Backend comparison", description="\n".join(lines),
+        color=discord.Color.green() if same else discord.Color.red(),
+    ))
 
 
 @bot.command(name="stats")
