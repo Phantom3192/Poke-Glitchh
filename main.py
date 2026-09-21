@@ -1,19 +1,29 @@
 """
 main.py - Watches for wild Pokemon spawn messages (e.g. from Poketwo)
-and replies with the species name predicted by OUR model + DB.
+and replies with the species name predicted by the AI_Model API.
 
-How identification works: the spawn image is embedded into a 256-dim vector
-with the trained EfficientNet-B0 feature extractor (predict.py / train_model.py)
-and matched by cosine similarity against every stored embedding in the DB
-(the "feature bank"). Because the bot only compares against that bank, it can
-LEARN without retraining: teaching it a new example just adds one more vector
-to the bank (saved to the DB and loaded into memory immediately).
+How identification works: this bot is now a PURE API CLIENT. It sends the
+spawn image (and image-only requests like s!predict / s!learn) as an HTTP
+call to your AI_Model server (server.py from the AI_Model repo), which owns
+the model, ONNX Runtime, and the feature bank ("DB"). This bot does not
+import torch/onnx/PIL/numpy or touch the database at all - it just uploads
+bytes and reads back JSON.
+
+    POST {AI_MODEL_API_URL}/v1/predict        -> single-image identification
+    POST {AI_MODEL_API_URL}/v1/predict/batch  -> micro-batched identification
+    POST {AI_MODEL_API_URL}/v1/learn          -> teach it a new example
+    POST {AI_MODEL_API_URL}/v1/forget         -> remove taught examples
+    GET  {AI_MODEL_API_URL}/v1/stats          -> bank size + latency numbers
+    GET  {AI_MODEL_API_URL}/health            -> readiness
+    POST {AI_MODEL_API_URL}/admin/reload      -> re-read model + feature bank
 
 Setup:
     1. pip install -r requirements.txt
-    2. Set DISCORD_TOKEN (and TURSO_URL / TURSO_AUTH_TOKEN, or DB_PATH) as
-       environment variables or in a .env file
-    3. Make sure models/pokemon_classifier.pt is your real trained model
+    2. Set DISCORD_TOKEN and AI_MODEL_API_URL (and AI_MODEL_API_KEY if your
+       AI_Model server has API_KEY set) as environment variables or in a
+       .env file. See .env.example.
+    3. Deploy/run the AI_Model server (server.py) somewhere reachable from
+       wherever this bot runs, and point AI_MODEL_API_URL at it.
     4. python main.py
 
 Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
@@ -21,14 +31,13 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
                            test identification without needing a live spawn
     s!learn <species>    - teach the bot: attach an image, or reply to a spawn /
                            image message, e.g.  s!learn pikachu
-                           (new species: s!learn --new <name>)
+                           (new species: s!learn --new <n>)
     s!forget <species>   - remove the examples you taught for that species
     s!undo               - remove the most recent example you taught
-    s!stats              - show how many species/features are loaded
-    s!compare            - accuracy check: active backend vs PyTorch on one image
+    s!stats              - show how many species/features the API has loaded
     s!api                - live performance dashboard (activity, active incense,
-                           inference/response times, cache hit rate, Pokémon named)
-    s!reload             - re-load the model + feature bank from disk/DB
+                           inference/response times, cache hit rate)
+    s!reload             - ask the API to re-load its model + feature bank
     s!threshold X        - view/change the confidence threshold at runtime
 
 Optional auto-learning (AUTO_LEARN=true): learns from the last spawn in a
@@ -46,48 +55,23 @@ See .env.example for all auto-learn variables.
 """
 
 import os
-import io
 import re
 import sys
-import gc
 import json
 import time
 import pickle
 import hashlib
-import uuid
 import asyncio
-import difflib
 import logging
-import threading
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
-import numpy as np
-import torch
 from discord.ext import commands
-from PIL import Image
 from dotenv import load_dotenv
 
-from predict import load_extractor, load_feature_bank, predict_species
-from onnx_backend import OnnxExtractor, onnx_matches_source
-from train_model import Database, MODEL_OUTPUT
-
 load_dotenv()
-
-# train_model.py (imported above) silences logging in several ways:
-#   - replaces logging.basicConfig with a no-op lambda
-#   - disables every logger that existed at import time (incl. discord.py's)
-#   - redirects sys.stderr to /dev/null
-# So basicConfig() can't be used here. Undo it by attaching a stdout handler
-# to the root logger directly and re-enabling the disabled loggers.
-for _name in list(logging.root.manager.loggerDict.keys()):
-    _lg = logging.getLogger(_name)
-    _lg.disabled = False
-    if _lg.level == logging.CRITICAL:
-        _lg.setLevel(logging.NOTSET)
 
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
@@ -105,63 +89,54 @@ _root.handlers = [_handler]
 _root.setLevel(logging.INFO)
 log = logging.getLogger("discord_bot")
 
-# ── Config ───────────────────────────────────────────────────────────────
+# ---- Config ---------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
-    raise SystemExit("❌ DISCORD_TOKEN is not set (check your .env file).")
+    raise SystemExit("Discord token is not set: set DISCORD_TOKEN (check your .env file).")
+
+# Base URL of your deployed AI_Model server.py, e.g.
+# https://my-pokemon-model.up.railway.app  (no trailing slash needed)
+AI_MODEL_API_URL = (os.getenv("AI_MODEL_API_URL") or "").rstrip("/")
+if not AI_MODEL_API_URL:
+    raise SystemExit(
+        "AI_MODEL_API_URL is not set (check your .env file). "
+        "Point it at your deployed AI_Model server.py, e.g. https://your-model.example.com"
+    )
+# Only needed if the AI_Model server was started with API_KEY set.
+AI_MODEL_API_KEY = os.getenv("AI_MODEL_API_KEY", "")
+AI_MODEL_TIMEOUT = float(os.getenv("AI_MODEL_TIMEOUT", "20"))
 
 # Default is Poketwo's real bot ID, since that's the most common spawn
 # source. Override via .env if you're scanning a different spawn bot.
 SPAWN_BOT_ID = int(os.getenv("SPAWN_BOT_ID", "716390085896962058"))
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "s!")
-BOT_MODEL_PATH = os.getenv("BOT_MODEL_PATH", MODEL_OUTPUT)
 
 # Cosine similarity score (0-1ish) required before the bot replies to a
-# spawn automatically. Start conservative and tune down/up once you've
-# watched real scores come through with s!predict or the logs.
+# spawn automatically. Also sent to the API as the `threshold` query param,
+# so s!threshold changes what the API calls "confident" too.
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-TOP_K = int(os.getenv("TOP_K", "5"))
 
 # If true, the bot stays silent on spawns it isn't confident about instead
 # of replying with a flagged low-confidence guess. Keep this off while
 # you're first tuning CONFIDENCE_THRESHOLD so you can see real scores.
 SILENT_BELOW_THRESHOLD = os.getenv("SILENT_BELOW_THRESHOLD", "false").lower() == "true"
 
-# If the single closest stored example is at least this similar, trust it
-# over the top-K majority vote. Without this, one freshly-taught example
-# (a correction) could be outvoted by 4 older neighbours of another species.
-NEAR_EXACT_SIM = float(os.getenv("NEAR_EXACT_SIM", "0.95"))
-
-# s!learn refuses to store an example that is (almost) identical to one the
-# species already has, so the bank doesn't fill up with duplicates.
-LEARN_DUP_SIM = float(os.getenv("LEARN_DUP_SIM", "0.995"))
-
-# ── Throughput tuning (many channels at once, e.g. 100 incense @ 20s) ───
-# os.cpu_count() on Railway & co. reports the HOST's cores, not your quota, so
-# torch's default thread count badly oversubscribes a 1 vCPU plan. Defaults
-# below are for 1 vCPU; on N vCPU set INFER_WORKERS=N (keep TORCH_THREADS=1).
-# BACKEND: "auto" = ONNX Runtime if it works (exported from the same .pt), else PyTorch;
-# "onnx" = ONNX or refuse to start; "torch" = always PyTorch. With AUTO_EXPORT_ONNX the
-# .onnx is (re)built on startup whenever it's missing or was made from a different .pt.
-BACKEND = os.getenv("BACKEND", "auto").lower()
-ONNX_MODEL_PATH = os.getenv("ONNX_MODEL_PATH") or os.path.splitext(BOT_MODEL_PATH)[0] + ".onnx"
-AUTO_EXPORT_ONNX = os.getenv("AUTO_EXPORT_ONNX", "true").lower() == "true"
-# Micro-batching: each worker groups up to BATCH_MAX queued images into one model call,
-# waiting at most BATCH_WAIT_MS for stragglers (0 = only group what's already waiting, so
-# it never adds latency). Measured on 1 thread it gave no speedup, so it's off (1) by default;
-# try BATCH_MAX=4..8 on multi-core hosts and compare inference time in s!api.
-BATCH_MAX = max(1, int(os.getenv("BATCH_MAX", "1")))
-BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "0")))
-INFER_WORKERS = max(1, int(os.getenv("INFER_WORKERS", "1")))
-TORCH_THREADS = max(1, int(os.getenv("TORCH_THREADS", "1")))
+# ---- Throughput tuning (many channels at once, e.g. 100 incense @ 20s) ----
+# Micro-batching: each worker groups up to BATCH_MAX queued images into one
+# /v1/predict/batch call, waiting at most BATCH_WAIT_MS for stragglers (0 =
+# only group what's already waiting, so it never adds latency).
+BATCH_MAX = max(1, int(os.getenv("BATCH_MAX", "4")))
+BATCH_WAIT_MS = max(0.0, float(os.getenv("BATCH_WAIT_MS", "25")))
+# How many /v1/predict(/batch) calls this bot will have in flight at once.
+API_CONCURRENCY = max(1, int(os.getenv("API_CONCURRENCY", "4")))
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
 # would arrive too late to be useful, and skipping lets the queue catch up.
 MAX_SPAWN_AGE = float(os.getenv("MAX_SPAWN_AGE", "15"))
-# Max cached image results (LRU). Same image bytes/URL -> no inference at all.
+# Max cached image results (LRU). Same image bytes/URL -> no API call at all.
 CACHE_SIZE = max(0, int(os.getenv("CACHE_SIZE", "5000")))
 # Cache is saved here every CACHE_SAVE_INTERVAL seconds and re-loaded on start
-# (only if the model + feature bank are unchanged), so restarts don't need a
-# warm-up. Set CACHE_FILE="" to disable.
+# (only if the API's feature bank is unchanged since), so restarts don't need
+# a warm-up. Set CACHE_FILE="" to disable.
 CACHE_FILE = os.getenv("CACHE_FILE", "spawn_cache.pkl")
 # Also skip the download when the same image URL was seen before. Off by default: results are
 # always cached by the image's exact bytes (provably identical input -> identical answer), a
@@ -173,10 +148,7 @@ CACHE_SAVE_INTERVAL = float(os.getenv("CACHE_SAVE_INTERVAL", "60"))
 METRICS_WINDOW = float(os.getenv("METRICS_WINDOW", "300"))
 ACTIVE_INCENSE_WINDOW = float(os.getenv("ACTIVE_INCENSE_WINDOW", "60"))
 
-torch.set_num_threads(TORCH_THREADS)
-_executor = ThreadPoolExecutor(max_workers=INFER_WORKERS, thread_name_prefix="infer")
-
-# ── Auto-learning (opt-in) ───────────────────────────────────────────────
+# ---- Auto-learning (opt-in) ------------------------------------------------
 AUTO_LEARN = os.getenv("AUTO_LEARN", "false").lower() == "true"
 # Where the "ground truth" species comes from: "catch" (the spawn bot's own
 # catch announcement) or "bot" (trust another bot's identification message).
@@ -198,7 +170,7 @@ _CATCH_RE = re.compile(CATCH_REGEX, re.IGNORECASE)
 AUTO_LEARN_SOURCE_BOT_ID = int(os.getenv("AUTO_LEARN_SOURCE_BOT_ID", "0") or 0)
 # Must capture the species name as group "species" and its stated confidence
 # (a bare number, no %) as group "confidence". Default matches messages like
-# "Timburr 🔶: 99.86%" / "Timburr: 99.86%\nBest name: Timburr".
+# "Timburr [emoji]: 99.86%" / "Timburr: 99.86%\nBest name: Timburr".
 AUTO_LEARN_SOURCE_REGEX = os.getenv(
     "AUTO_LEARN_SOURCE_REGEX",
     r"^(?P<species>[A-Za-z][A-Za-z.\-' ]*?)\s+\S*:\s*(?P<confidence>[\d.]+)\s*%",
@@ -216,390 +188,120 @@ if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and not AUTO_LEARN_SOURCE_BOT_ID:
 if AUTO_LEARN and AUTO_LEARN_SOURCE not in ("catch", "bot"):
     raise RuntimeError(f"AUTO_LEARN_SOURCE must be 'catch' or 'bot', got {AUTO_LEARN_SOURCE!r}")
 
-# Rows added by s!learn / auto-learn carry this marker in variant_name, which
-# is how s!forget / s!undo tell them apart from the original training data.
-LEARNED_MARK = "__learned_"
-
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-# ── Model + feature bank (loaded once, refreshed via s!reload) ─────────────
-# _species_list / _matrix are always REPLACED (never mutated in place) while
-# holding _bank_lock, so worker threads can grab a consistent snapshot.
-_bank_lock = threading.RLock()
-_extractor = None
-_species_list = None
-_matrix = None
-_db: Optional[Database] = None
+# ---- HTTP session + AI_Model API client ------------------------------------
 _session: Optional[aiohttp.ClientSession] = None
-
-# channel_id -> (timestamp, guessed species, score, query vector) for the most
-# recent spawn we successfully analysed; None if we saw a spawn but couldn't.
-_last_spawn: Dict[int, Optional[Tuple[float, str, float, np.ndarray]]] = {}
-
-# channel_id -> generation counter; a newer spawn in a channel supersedes older
-# queued ones (they're skipped instead of wasting CPU on an outdated image).
-_spawn_gen: Dict[int, int] = {}
-
-# Result cache. Cleared whenever the feature bank changes (learn/forget/undo/
-# reload) so corrections always take effect. _bank_version stops a worker that
-# started before a change from writing a stale result afterwards.
-_cache_lock = threading.Lock()
-_result_cache: "OrderedDict[str, tuple]" = OrderedDict()   # sha1(image bytes) -> result tuple
-_url_cache: "OrderedDict[str, str]" = OrderedDict()        # image url -> sha1
-_bank_version = 0
-_stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0, "batches": 0, "batch_items": 0}
-_backend_name = "PyTorch CPU"
-_cache_dirty = False
-# In-flight work, so N channels spawning the same image at once cost ONE download/inference.
-_inflight_url: Dict[str, dict] = {}
-_inflight_digest: Dict[str, dict] = {}
-_saver_started = False
+_api_sem: Optional[asyncio.Semaphore] = None
 
 
-def _cache_clear():
-    global _bank_version, _cache_dirty
-    with _cache_lock:
-        _bank_version += 1
-        _cache_dirty = False
-        _result_cache.clear()
-        _url_cache.clear()
-
-
-def _cache_version() -> int:
-    with _cache_lock:
-        return _bank_version
-
-
-def _cache_get(digest: str):
-    with _cache_lock:
-        res = _result_cache.get(digest)
-        if res is not None:
-            _result_cache.move_to_end(digest)
-        return res
-
-
-def _cache_get_by_url(url: str):
-    with _cache_lock:
-        digest = _url_cache.get(url)
-        if digest is None:
-            return None
-        res = _result_cache.get(digest)
-        if res is not None:
-            _result_cache.move_to_end(digest)
-            _url_cache.move_to_end(url)
-        return res
-
-
-def _cache_put(digest: str, result: tuple, version: int, url: Optional[str] = None):
-    global _cache_dirty
-    if CACHE_SIZE <= 0:
-        return
-    with _cache_lock:
-        if version != _bank_version:
-            return
-        _cache_dirty = True
-        _result_cache[digest] = result
-        _result_cache.move_to_end(digest)
-        while len(_result_cache) > CACHE_SIZE:
-            _result_cache.popitem(last=False)
-        if url:
-            _url_cache[url] = digest
-            _url_cache.move_to_end(url)
-            while len(_url_cache) > CACHE_SIZE:
-                _url_cache.popitem(last=False)
-
-
-async def _in_executor(fn, *args):
-    return await asyncio.get_running_loop().run_in_executor(_executor, fn, *args)
-
-
-# ── s!api metrics (rolling window) ───────────────────────────────────────
-_metrics_lock = threading.Lock()
-_m_inference: deque = deque()   # (ts, ms) model forward pass, one entry per real inference
-_m_store: deque = deque()       # (ts, ms) feature-bank lookup + vote
-_m_response: deque = deque()    # (ts, ms) spawn seen -> reply sent
-_m_spawns: deque = deque()      # (ts, 1)  every spawn seen
-_channel_last_spawn: Dict[int, float] = {}
-_named_total = 0
-
-
-def _m_add(dq: deque, value):
-    now = time.time()
-    with _metrics_lock:
-        dq.append((now, value))
-        cutoff = now - METRICS_WINDOW
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
-
-
-def _m_values(dq: deque, since: Optional[float] = None):
-    cutoff = time.time() - (METRICS_WINDOW if since is None else since)
-    with _metrics_lock:
-        return [v for ts, v in dq if ts >= cutoff]
-
-
-def _fmt_ms(v: Optional[float]) -> str:
-    if v is None:
-        return "—"
-    return f"{v / 1000:.3f}s" if v >= 1000 else f"{v:.0f} ms"
-
-
-def _activity(rate: float):
-    """rate = spawns/sec over the last minute -> (label, embed colour name)."""
-    if rate <= 0:
-        return "⚪ Idle", "light_grey"
-    if rate < 2:
-        return "🟢 Low Activity", "green"
-    if rate < 6:
-        return "🟡 Moderate Activity", "gold"
-    if rate < 15:
-        return "🟠 High Activity", "orange"
-    return "🔴 Very High Activity", "red"
-
-
-def _api_snapshot() -> dict:
-    now = time.time()
-    inf, store, resp = _m_values(_m_inference), _m_values(_m_store), _m_values(_m_response)
-    spawns = len(_m_values(_m_spawns))
-    rate = len(_m_values(_m_spawns, since=60)) / 60.0
-    for cid in [c for c, t in _channel_last_spawn.items() if now - t > METRICS_WINDOW]:
-        del _channel_last_spawn[cid]
-    active = sum(1 for t in _channel_last_spawn.values() if now - t <= ACTIVE_INCENSE_WINDOW)
-
-    def stats(vals):
-        return (min(vals), max(vals), sum(vals) / len(vals), vals[-1]) if vals else (None,) * 4
-
-    label, color = _activity(rate)
-    _, _, matrix = _snapshot()
-    return {
-        "activity": label, "color": color, "rate": rate, "active": active,
-        "hit_rate": None if spawns == 0 else max(0.0, 1.0 - len(inf) / spawns),
-        "store": stats(store), "inference": stats(inf), "response": stats(resp),
-        "bank": int(matrix.shape[0]), "named": _named_total,
-    }
-
-
-def _build_api_embed() -> discord.Embed:
-    d = _api_snapshot()
-    embed = discord.Embed(title="API Status", color=getattr(discord.Color, d["color"])())
-
-    def field(name, value):
-        embed.add_field(name=name, value=value, inline=True)
-
-    s_min, s_max, s_avg, s_last = d["store"]
-    i_min, i_max, i_avg, i_last = d["inference"]
-    r_min, r_max, r_avg, r_last = d["response"]
-    field("Activity", d["activity"])
-    field("Active Incense", f"`{d['active']}`")
-    field("Cache Hit Rate", "—" if d["hit_rate"] is None else f"{d['hit_rate'] * 100:.0f}%")
-    field("Store (latest)", _fmt_ms(s_last))
-    field("Store (avg)", _fmt_ms(s_avg))
-    field("Bank Size", f"{d['bank']:,}")
-    field("Inference Fastest", _fmt_ms(i_min))
-    field("Inference Slowest", _fmt_ms(i_max))
-    field("Inference Avg", _fmt_ms(i_avg))
-    field("Inference Latest", _fmt_ms(i_last))
-    field("Response Fastest", _fmt_ms(r_min))
-    field("Response Slowest", _fmt_ms(r_max))
-    field("Response Avg", _fmt_ms(r_avg))
-    field("Response Latest", _fmt_ms(r_last))
-    field("Pokémons Named", f"{d['named']:,}")
-    embed.set_footer(
-        text=f"Model: {os.path.basename(BOT_MODEL_PATH)} | Backend: {_backend_name} "
-             f"(threads={TORCH_THREADS}, workers={INFER_WORKERS}, batch≤{BATCH_MAX}) | "
-             f"Window: {METRICS_WINDOW / 60:g} min rolling"
-    )
-    return embed
-
-
-def _bank_fingerprint():
-    """Identifies the exact model + feature bank a cached result was computed against."""
-    with _bank_lock:
-        rows = int(_matrix.shape[0])
-        total = round(float(_matrix.sum(dtype=np.float64)), 4)
-    try:
-        model_size = os.path.getsize(BOT_MODEL_PATH)
-    except OSError:
-        model_size = -1
-    return (rows, total, model_size)
-
-
-def _cache_save():
-    global _cache_dirty
-    if not CACHE_FILE or CACHE_SIZE <= 0:
-        return
-    version = _cache_version()
-    fingerprint = _bank_fingerprint()  # taken outside _cache_lock (lock order: bank -> cache)
-    with _cache_lock:
-        if not _cache_dirty or version != _bank_version:
-            return
-        payload = {"fp": fingerprint, "results": list(_result_cache.items()), "urls": list(_url_cache.items())}
-        _cache_dirty = False
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, CACHE_FILE)
-
-
-def _cache_load():
-    if not CACHE_FILE or CACHE_SIZE <= 0 or not os.path.exists(CACHE_FILE):
-        return
-    try:
-        with open(CACHE_FILE, "rb") as f:
-            payload = pickle.load(f)
-        if payload.get("fp") != _bank_fingerprint():
-            log.info("🗂️  Saved spawn cache doesn't match the current model/bank — ignoring it")
-            return
-        with _cache_lock:
-            for key, val in payload["results"][-CACHE_SIZE:]:
-                _result_cache[key] = val
-            for url, digest in payload["urls"][-CACHE_SIZE:]:
-                if digest in _result_cache:
-                    _url_cache[url] = digest
-            n = len(_result_cache)
-        log.info(f"🗂️  Loaded {n} cached spawn results from {CACHE_FILE}")
-    except Exception as e:
-        log.warning(f"Couldn't load spawn cache ({type(e).__name__}: {e}) — starting empty")
-
-
-async def _cache_saver():
-    while True:
-        await asyncio.sleep(CACHE_SAVE_INTERVAL)
-        try:
-            await asyncio.to_thread(_cache_save)
-        except Exception as e:
-            log.warning(f"Couldn't save spawn cache ({type(e).__name__}: {e})")
-
-
-async def _coalesced(table: Dict[str, dict], key: str, received: float, work, deps=None):
-    """Run work(entry) once per key at a time; concurrent callers with the same key share its result."""
-    entry = table.get(key)
-    if entry is not None:
-        entry["latest"] = max(entry["latest"], received)
-        _stats["coalesced"] += 1
-        return await asyncio.shield(entry["fut"])
-    entry = {"fut": asyncio.get_running_loop().create_future(), "latest": received, "deps": list(deps or [])}
-    table[key] = entry
-    result = None
-    try:
-        result = await work(entry)
-    except Exception as e:
-        log.error(f"Identification failed: {type(e).__name__}: {e}")
-    finally:
-        table.pop(key, None)
-        if not entry["fut"].done():
-            entry["fut"].set_result(result)
-    return result
-
-
-def _entry_latest(entry: dict) -> float:
-    latest = entry["latest"]
-    for dep in entry.get("deps", ()):
-        latest = max(latest, _entry_latest(dep))
-    return latest
-
-
-async def _identify_spawn(url: str, received: float):
-    """Returns (winner, score, neighbors, query_vec) or None. Cache -> coalesce -> download -> hash -> infer."""
-    res = _cache_get_by_url(url) if URL_CACHE else None
-    if res is not None:
-        _stats["hits"] += 1
-        return res
-    cache_url = url if URL_CACHE else None
-
-    async def work(url_entry):
-        image_bytes = await _download(url)
-        if not image_bytes:
-            return None
-        digest = hashlib.sha1(image_bytes).hexdigest()
-        version = _cache_version()
-        res = _cache_get(digest)
-        if res is not None:
-            _stats["hits"] += 1
-            _cache_put(digest, res, version, cache_url)
-            return res
-
-        async def infer(digest_entry):
-            out = await _submit_identification(image_bytes, digest_entry)
-            if out is not None:
-                _stats["misses"] += 1
-            return out
-
-        res = await _coalesced(_inflight_digest, digest, received, infer, deps=[url_entry])
-        if res is not None:
-            _cache_put(digest, res, version, cache_url)
-        return res
-
-    return await _coalesced(_inflight_url, url, received, work)
-
-
-def _try_onnx():
-    """Returns an OnnxExtractor that matches BOT_MODEL_PATH, or None (caller falls back to PyTorch)."""
-    global _backend_name
-    try:
-        state = onnx_matches_source(ONNX_MODEL_PATH, BOT_MODEL_PATH)  # True / False / None (no sidecar)
-        exists = os.path.exists(ONNX_MODEL_PATH)
-        if not exists or state is not True:  # missing, made from a different .pt, or no sidecar to prove it
-            if not AUTO_EXPORT_ONNX:
-                why = "can't be matched to the current .pt" if exists else "not found"
-                log.warning(f"ONNX model {why} and AUTO_EXPORT_ONNX is off")
-                return None
-            log.info("🔧 Exporting ONNX model (one-time, ~10-30s) ...")
-            from export_onnx import export_to_onnx
-            torch_ex = load_extractor(BOT_MODEL_PATH)
-            stats = export_to_onnx(torch_ex, ONNX_MODEL_PATH, BOT_MODEL_PATH)
-            log.info(f"   ✅ ONNX verified vs PyTorch (min cosine {stats['min_cos']:.6f})")
-            del torch_ex
-            gc.collect()
-        ex = OnnxExtractor(ONNX_MODEL_PATH, threads=TORCH_THREADS)
-        _backend_name = "ONNX Runtime"
-        return ex
-    except Exception as e:
-        log.warning(f"ONNX backend unavailable ({type(e).__name__}: {e})")
-        return None
-
-
-def _load_extractor():
-    global _backend_name
-    mode = BACKEND if BACKEND in ("auto", "onnx", "torch") else "auto"
-    if mode != "torch":
-        ex = _try_onnx()
-        if ex is not None:
-            return ex
-        if mode == "onnx":
-            raise SystemExit("❌ BACKEND=onnx but the ONNX model couldn't be loaded (see the warning above).")
-        log.info("   Falling back to PyTorch")
-    _backend_name = "PyTorch CPU"
-    return load_extractor(BOT_MODEL_PATH)
-
-
-def _load_model_and_bank():
-    global _extractor, _species_list, _matrix, _db
-    log.info(f"📦 Loading model from {BOT_MODEL_PATH} ...")
-    extractor = _load_extractor()
-    log.info(f"   Backend: {_backend_name}")
-
-    log.info("🗄️  Connecting to database and loading feature bank ...")
-    new_db = Database()
-    species_list, matrix = load_feature_bank(new_db)
-
-    with _bank_lock:
-        old_db = _db
-        _extractor, _db, _species_list, _matrix = extractor, new_db, species_list, matrix
-    _cache_clear()
-    if old_db is not None:
-        old_db.close()
-    log.info(f"   Loaded {matrix.shape[0]} feature vectors across {len(set(species_list))} species")
+class ApiError(Exception):
+    """Raised for any non-2xx response from the AI_Model API."""
+    def __init__(self, status: int, detail: Any):
+        self.status = status
+        self.detail = detail
+        text = detail if isinstance(detail, str) else json.dumps(detail)
+        super().__init__(f"HTTP {status}: {text}")
 
 
 async def _get_session() -> aiohttp.ClientSession:
-    global _session
+    global _session, _api_sem
     if _session is None or _session.closed:
         _session = aiohttp.ClientSession()
+    if _api_sem is None:
+        _api_sem = asyncio.Semaphore(API_CONCURRENCY)
     return _session
+
+
+async def _api_request(method: str, path: str, **kwargs) -> dict:
+    sess = await _get_session()
+    headers = kwargs.pop("headers", {}) or {}
+    if AI_MODEL_API_KEY:
+        headers["X-API-Key"] = AI_MODEL_API_KEY
+    url = f"{AI_MODEL_API_URL}{path}"
+    timeout = aiohttp.ClientTimeout(total=AI_MODEL_TIMEOUT)
+    async with _api_sem:
+        async with sess.request(method, url, headers=headers, timeout=timeout, **kwargs) as resp:
+            ctype = resp.content_type or ""
+            if "json" in ctype:
+                body = await resp.json()
+            else:
+                body = {"raw": (await resp.text())[:500]}
+            if resp.status >= 400:
+                detail = body.get("detail", body) if isinstance(body, dict) else body
+                raise ApiError(resp.status, detail)
+            return body
+
+
+def _file_field(name: str, image_bytes: bytes):
+    form = aiohttp.FormData()
+    form.add_field(name, image_bytes, filename="image.jpg", content_type="application/octet-stream")
+    return form
+
+
+async def api_health() -> dict:
+    return await _api_request("GET", "/health")
+
+
+async def api_stats() -> dict:
+    return await _api_request("GET", "/v1/stats")
+
+
+async def api_predict(image_bytes: bytes, *, threshold: Optional[float] = None,
+                       include_embedding: bool = False) -> dict:
+    form = _file_field("file", image_bytes)
+    params = {}
+    if threshold is not None:
+        params["threshold"] = str(threshold)
+    if include_embedding:
+        params["include_embedding"] = "true"
+    return await _api_request("POST", "/v1/predict", data=form, params=params)
+
+
+async def api_predict_batch(images_bytes: List[bytes], *, threshold: Optional[float] = None,
+                             include_embedding: bool = False) -> List[Optional[dict]]:
+    form = aiohttp.FormData()
+    for i, b in enumerate(images_bytes):
+        form.add_field("files", b, filename=f"image{i}.jpg", content_type="application/octet-stream")
+    params = {}
+    if threshold is not None:
+        params["threshold"] = str(threshold)
+    if include_embedding:
+        params["include_embedding"] = "true"
+    body = await _api_request("POST", "/v1/predict/batch", data=form, params=params)
+    out = []
+    for r in body["results"]:
+        out.append(r if r.get("ok") else None)
+    return out
+
+
+async def api_learn(species: str, *, allow_new: bool = False,
+                     file_bytes: Optional[bytes] = None,
+                     embedding: Optional[List[float]] = None) -> dict:
+    form = aiohttp.FormData()
+    form.add_field("species", species)
+    form.add_field("allow_new", "true" if allow_new else "false")
+    if file_bytes is not None:
+        form.add_field("file", file_bytes, filename="image.jpg", content_type="application/octet-stream")
+    if embedding is not None:
+        form.add_field("embedding", json.dumps(list(embedding)))
+    return await _api_request("POST", "/v1/learn", data=form)
+
+
+async def api_forget(*, species: Optional[str] = None, last: bool = False) -> dict:
+    payload: dict = {}
+    if species:
+        payload["species"] = species
+    if last:
+        payload["last"] = True
+    return await _api_request("POST", "/v1/forget", json=payload)
+
+
+async def api_reload() -> dict:
+    return await _api_request("POST", "/admin/reload")
 
 
 async def _download(url: str) -> Optional[bytes]:
@@ -613,6 +315,215 @@ async def _download(url: str) -> Optional[bytes]:
     except Exception as e:
         log.warning(f"Image download error ({type(e).__name__}): {e}")
         return None
+
+
+# ---- Bank-version tracking (drives cache invalidation) ---------------------
+# Every /v1/predict(/batch), /v1/learn and /v1/forget response carries the
+# API's current bank_version. Whenever it changes (because we taught/forgot
+# something, or someone else did via the API) the cache is stale and gets
+# dropped - there's no local feature matrix to fingerprint anymore.
+_known_bank_version: Optional[int] = None
+
+
+async def _note_bank_version(version: Optional[int]):
+    global _known_bank_version
+    if version is None:
+        return
+    if _known_bank_version is not None and version != _known_bank_version:
+        await _cache_clear()
+    _known_bank_version = version
+
+
+# ---- Result cache (by image hash) ------------------------------------------
+_cache_lock = asyncio.Lock()
+_result_cache: "OrderedDict[str, tuple]" = OrderedDict()   # sha1(image bytes) -> result tuple
+_url_cache: "OrderedDict[str, str]" = OrderedDict()        # image url -> sha1
+_cache_dirty = False
+_stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0, "batches": 0, "batch_items": 0}
+
+
+async def _cache_clear():
+    global _cache_dirty
+    async with _cache_lock:
+        _cache_dirty = False
+        _result_cache.clear()
+        _url_cache.clear()
+
+
+async def _cache_get(digest: str):
+    async with _cache_lock:
+        res = _result_cache.get(digest)
+        if res is not None:
+            _result_cache.move_to_end(digest)
+        return res
+
+
+async def _cache_get_by_url(url: str):
+    async with _cache_lock:
+        digest = _url_cache.get(url)
+        if digest is None:
+            return None
+        res = _result_cache.get(digest)
+        if res is not None:
+            _result_cache.move_to_end(digest)
+            _url_cache.move_to_end(url)
+        return res
+
+
+async def _cache_put(digest: str, result: tuple, url: Optional[str] = None):
+    global _cache_dirty
+    if CACHE_SIZE <= 0:
+        return
+    async with _cache_lock:
+        _cache_dirty = True
+        _result_cache[digest] = result
+        _result_cache.move_to_end(digest)
+        while len(_result_cache) > CACHE_SIZE:
+            _result_cache.popitem(last=False)
+        if url:
+            _url_cache[url] = digest
+            _url_cache.move_to_end(url)
+            while len(_url_cache) > CACHE_SIZE:
+                _url_cache.popitem(last=False)
+
+
+def _cache_save():
+    global _cache_dirty
+    if not CACHE_FILE or CACHE_SIZE <= 0 or not _cache_dirty:
+        return
+    payload = {"fp": _known_bank_version, "results": list(_result_cache.items()), "urls": list(_url_cache.items())}
+    _cache_dirty = False
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, CACHE_FILE)
+
+
+def _cache_load():
+    if not CACHE_FILE or CACHE_SIZE <= 0 or not os.path.exists(CACHE_FILE):
+        return
+    try:
+        with open(CACHE_FILE, "rb") as f:
+            payload = pickle.load(f)
+        if payload.get("fp") != _known_bank_version:
+            log.info("Saved spawn cache doesn't match the API's current feature bank - ignoring it")
+            return
+        for key, val in payload["results"][-CACHE_SIZE:]:
+            _result_cache[key] = val
+        for url, digest in payload["urls"][-CACHE_SIZE:]:
+            if digest in _result_cache:
+                _url_cache[url] = digest
+        log.info(f"Loaded {len(_result_cache)} cached spawn results from {CACHE_FILE}")
+    except Exception as e:
+        log.warning(f"Couldn't load spawn cache ({type(e).__name__}: {e}) - starting empty")
+
+
+async def _cache_saver():
+    while True:
+        await asyncio.sleep(CACHE_SAVE_INTERVAL)
+        try:
+            await asyncio.to_thread(_cache_save)
+        except Exception as e:
+            log.warning(f"Couldn't save spawn cache ({type(e).__name__}: {e})")
+
+
+# ---- s!api metrics (rolling window) ----------------------------------------
+_m_inference: deque = deque()   # (ts, ms) API embed time, one entry per real inference
+_m_store: deque = deque()       # (ts, ms) API feature-bank match time
+_m_response: deque = deque()    # (ts, ms) spawn seen -> reply sent
+_m_spawns: deque = deque()      # (ts, 1)  every spawn seen
+_channel_last_spawn: Dict[int, float] = {}
+_named_total = 0
+
+
+def _m_add(dq: deque, value):
+    now = time.time()
+    dq.append((now, value))
+    cutoff = now - METRICS_WINDOW
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+def _m_values(dq: deque, since: Optional[float] = None):
+    cutoff = time.time() - (METRICS_WINDOW if since is None else since)
+    return [v for ts, v in dq if ts >= cutoff]
+
+
+def _fmt_ms(v: Optional[float]) -> str:
+    if v is None:
+        return "-"
+    return f"{v / 1000:.3f}s" if v >= 1000 else f"{v:.0f} ms"
+
+
+def _activity(rate: float):
+    """rate = spawns/sec over the last minute -> (label, embed colour name)."""
+    if rate <= 0:
+        return "Idle", "light_grey"
+    if rate < 2:
+        return "Low Activity", "green"
+    if rate < 6:
+        return "Moderate Activity", "gold"
+    if rate < 15:
+        return "High Activity", "orange"
+    return "Very High Activity", "red"
+
+
+async def _api_snapshot() -> dict:
+    now = time.time()
+    inf, store, resp = _m_values(_m_inference), _m_values(_m_store), _m_values(_m_response)
+    spawns = len(_m_values(_m_spawns))
+    rate = len(_m_values(_m_spawns, since=60)) / 60.0
+    for cid in [c for c, t in _channel_last_spawn.items() if now - t > METRICS_WINDOW]:
+        del _channel_last_spawn[cid]
+    active = sum(1 for t in _channel_last_spawn.values() if now - t <= ACTIVE_INCENSE_WINDOW)
+
+    def stats(vals):
+        return (min(vals), max(vals), sum(vals) / len(vals), vals[-1]) if vals else (None,) * 4
+
+    label, color = _activity(rate)
+    try:
+        health = await api_health()
+        bank_size = health.get("vectors", 0)
+    except Exception:
+        bank_size = 0
+    return {
+        "activity": label, "color": color, "rate": rate, "active": active,
+        "hit_rate": None if spawns == 0 else max(0.0, 1.0 - len(inf) / spawns),
+        "store": stats(store), "inference": stats(inf), "response": stats(resp),
+        "bank": int(bank_size), "named": _named_total,
+    }
+
+
+async def _build_api_embed() -> discord.Embed:
+    d = await _api_snapshot()
+    embed = discord.Embed(title="API Status", color=getattr(discord.Color, d["color"])())
+
+    def field(name, value):
+        embed.add_field(name=name, value=value, inline=True)
+
+    s_min, s_max, s_avg, s_last = d["store"]
+    i_min, i_max, i_avg, i_last = d["inference"]
+    r_min, r_max, r_avg, r_last = d["response"]
+    field("Activity", d["activity"])
+    field("Active Incense", f"`{d['active']}`")
+    field("Cache Hit Rate", "-" if d["hit_rate"] is None else f"{d['hit_rate'] * 100:.0f}%")
+    field("Store (latest)", _fmt_ms(s_last))
+    field("Store (avg)", _fmt_ms(s_avg))
+    field("Bank Size", f"{d['bank']:,}")
+    field("Embed Fastest", _fmt_ms(i_min))
+    field("Embed Slowest", _fmt_ms(i_max))
+    field("Embed Avg", _fmt_ms(i_avg))
+    field("Embed Latest", _fmt_ms(i_last))
+    field("Response Fastest", _fmt_ms(r_min))
+    field("Response Slowest", _fmt_ms(r_max))
+    field("Response Avg", _fmt_ms(r_avg))
+    field("Response Latest", _fmt_ms(r_last))
+    field("Pokemons Named", f"{d['named']:,}")
+    embed.set_footer(
+        text=f"API: {AI_MODEL_API_URL} | concurrency={API_CONCURRENCY}, batch<={BATCH_MAX} | "
+             f"Window: {METRICS_WINDOW / 60:g} min rolling"
+    )
+    return embed
 
 
 def _is_wild_spawn_embed(embed: discord.Embed) -> bool:
@@ -639,73 +550,56 @@ def _extract_wild_spawn_image_url(message: discord.Message) -> Optional[str]:
     return None
 
 
-# ── Identification ───────────────────────────────────────────────────────
+# ---- Identification (via API) ----------------------------------------------
+# A "result" tuple throughout this file is (winner, score, neighbors, embedding),
+# matching the shape the old local-inference code used, so the rest of the bot
+# (auto-learn, caching, display) didn't need to change shape.
 
-def _snapshot():
-    with _bank_lock:
-        return _extractor, _species_list, _matrix
-
-
-def _embed_image_bytes(image_bytes: bytes) -> np.ndarray:
-    extractor, _, _ = _snapshot()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return extractor.extract(img)
+def _result_from_predict(data: dict) -> tuple:
+    neighbors = [(n["species"], n["score"]) for n in data.get("neighbors", [])]
+    return data["species"], data["score"], neighbors, data.get("embedding")
 
 
-def _predict(query_vec: np.ndarray, species_list, matrix):
-    """predict_species() + trust a near-exact single match over the majority vote."""
-    winner, score, neighbors = predict_species(query_vec, species_list, matrix, top_k=TOP_K)
-    top_species, top_sim = neighbors[0]
-    if top_species != winner and top_sim >= NEAR_EXACT_SIM:
-        winner, score = top_species, top_sim
-    return winner, score, neighbors
+async def _identify_one(image_bytes: bytes) -> Optional[tuple]:
+    try:
+        data = await api_predict(image_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=True)
+    except ApiError as e:
+        if e.status != 422:  # 422 = unreadable image, not worth logging as an error
+            log.error(f"Predict API error: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Predict API unreachable ({type(e).__name__}): {e}")
+        return None
+    await _note_bank_version(data.get("bank_version"))
+    _m_add(_m_inference, data.get("timing_ms", {}).get("embed", 0.0))
+    _m_add(_m_store, data.get("timing_ms", {}).get("match", 0.0))
+    return _result_from_predict(data)
 
 
-def _run_identification(image_bytes: bytes):
-    """Runs in a worker thread — torch inference + numpy matmul are blocking/CPU-bound."""
-    _, species_list, matrix = _snapshot()
-    t0 = time.perf_counter()
-    query_vec = _embed_image_bytes(image_bytes)
-    t1 = time.perf_counter()
-    winner, score, neighbors = _predict(query_vec, species_list, matrix)
-    t2 = time.perf_counter()
-    _m_add(_m_inference, (t1 - t0) * 1000)
-    _m_add(_m_store, (t2 - t1) * 1000)
-    return winner, score, neighbors, query_vec
-
-
-def _run_identification_batch(images_bytes):
-    """Worker thread: embed a group of images in one model call, then match each. None = unreadable image."""
-    extractor, species_list, matrix = _snapshot()
-    imgs = []
-    for b in images_bytes:
-        try:
-            imgs.append(Image.open(io.BytesIO(b)).convert("RGB"))
-        except Exception:
-            imgs.append(None)
-    n_valid = sum(1 for im in imgs if im is not None)
-    t0 = time.perf_counter()
-    if isinstance(extractor, OnnxExtractor):
-        vecs = extractor.extract_batch(imgs)  # row i always belongs to imgs[i]
-    else:  # PyTorch fallback: one image at a time (its extract_batch can misalign on failures)
-        vecs = [extractor.extract(im) if im is not None else None for im in imgs]
-    per_image_ms = (time.perf_counter() - t0) * 1000 / max(1, n_valid)
-
-    results = []
-    for im, vec in zip(imgs, vecs):
-        if im is None or vec is None or float(np.linalg.norm(vec)) < 1e-6:
-            results.append(None)
+async def _identify_batch(images_bytes: List[bytes]) -> List[Optional[tuple]]:
+    try:
+        results = await api_predict_batch(images_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=True)
+    except Exception as e:
+        log.error(f"Batch predict API error ({type(e).__name__}): {e}")
+        return [None] * len(images_bytes)
+    out = []
+    for r in results:
+        if r is None:
+            out.append(None)
             continue
-        t1 = time.perf_counter()
-        winner, score, neighbors = _predict(vec, species_list, matrix)
-        _m_add(_m_store, (time.perf_counter() - t1) * 1000)
-        _m_add(_m_inference, per_image_ms)
-        results.append((winner, score, neighbors, vec))
-    return results
+        await _note_bank_version(r.get("bank_version"))
+        _m_add(_m_inference, r.get("timing_ms", {}).get("embed", 0.0))
+        _m_add(_m_store, r.get("timing_ms", {}).get("match", 0.0))
+        out.append(_result_from_predict(r))
+    return out
 
 
 _batch_queue: Optional[asyncio.Queue] = None
 _batch_tasks = []
+
+
+def _entry_latest(entry: dict) -> float:
+    return entry["latest"] if entry else time.time()
 
 
 async def _batch_worker():
@@ -739,7 +633,7 @@ async def _batch_worker():
         if not live:
             continue
         try:
-            results = await loop.run_in_executor(_executor, _run_identification_batch, [b for b, _ in live])
+            results = await _identify_batch([b for b, _ in live])
         except Exception as e:
             log.error(f"Batch inference failed: {type(e).__name__}: {e}")
             results = [None] * len(live)
@@ -751,150 +645,102 @@ async def _batch_worker():
 
 
 async def _submit_identification(image_bytes: bytes, entry: dict):
-    """Queue an image for the (micro-batching) inference workers; resolves to a result tuple or None."""
+    """Queue an image for the (micro-batching) API workers; resolves to a result tuple or None."""
     global _batch_queue
     if _batch_queue is None:
         _batch_queue = asyncio.Queue()
-        _batch_tasks.extend(asyncio.create_task(_batch_worker()) for _ in range(INFER_WORKERS))
+        _batch_tasks.extend(asyncio.create_task(_batch_worker()) for _ in range(API_CONCURRENCY))
     fut = asyncio.get_running_loop().create_future()
     _batch_queue.put_nowait((image_bytes, entry, fut))
     return await fut
 
 
-# ── Learning ─────────────────────────────────────────────────────────────
+_inflight_url: Dict[str, dict] = {}
+_inflight_digest: Dict[str, dict] = {}
+
+
+async def _coalesced(table: Dict[str, dict], key: str, received: float, work, deps=None):
+    """Run work(entry) once per key at a time; concurrent callers with the same key share its result."""
+    entry = table.get(key)
+    if entry is None:
+        entry = {"latest": received, "fut": None, "deps": deps or []}
+        table[key] = entry
+    else:
+        entry["latest"] = max(entry["latest"], received)
+        entry["deps"] = (entry.get("deps") or []) + (deps or [])
+        _stats["coalesced"] += 1
+
+    if entry["fut"] is None:
+        entry["fut"] = asyncio.get_running_loop().create_future()
+        try:
+            result = await work(entry)
+            if not entry["fut"].done():
+                entry["fut"].set_result(result)
+        except Exception as e:
+            if not entry["fut"].done():
+                entry["fut"].set_exception(e)
+            raise
+        finally:
+            if table.get(key) is entry:
+                del table[key]
+    return await entry["fut"]
+
+
+async def _identify_spawn(url: str, received: float):
+    """Returns (winner, score, neighbors, embedding) or None. Cache -> coalesce -> download -> hash -> infer."""
+    res = await _cache_get_by_url(url) if URL_CACHE else None
+    if res is not None:
+        _stats["hits"] += 1
+        return res
+    cache_url = url if URL_CACHE else None
+
+    async def work(url_entry):
+        image_bytes = await _download(url)
+        if not image_bytes:
+            return None
+        digest = hashlib.sha1(image_bytes).hexdigest()
+        res = await _cache_get(digest)
+        if res is not None:
+            _stats["hits"] += 1
+            await _cache_put(digest, res, cache_url)
+            return res
+
+        async def infer(digest_entry):
+            out = await _submit_identification(image_bytes, digest_entry)
+            if out is not None:
+                _stats["misses"] += 1
+            return out
+
+        res = await _coalesced(_inflight_digest, digest, received, infer, deps=[url_entry])
+        if res is not None:
+            await _cache_put(digest, res, cache_url)
+        return res
+
+    return await _coalesced(_inflight_url, url, received, work)
+
+
+# ---- Learning (via API) -----------------------------------------------------
 
 def _key(name: str) -> str:
     """Loose comparison key so 'Mr. Mime', 'mr_mime' and 'mr._mime' all match."""
-    return re.sub(r"[^a-z0-9♀♂]+", "", name.lower())
-
-
-def _new_species_name(name: str) -> str:
-    return re.sub(r"\s+", "_", name.strip().lower())
+    return re.sub(r"[^a-z0-9\u2640\u2642]+", "", name.lower())
 
 
 def _display(species: str) -> str:
     return species.replace("_", " ").title()
 
 
-def _find_species(name: str) -> Optional[str]:
-    key = _key(name)
-    with _bank_lock:
-        for sp in set(_species_list):
-            if _key(sp) == key:
-                return sp
-    return None
+async def _learn(species: str, *, allow_new: bool = False,
+                  file_bytes: Optional[bytes] = None, embedding: Optional[List[float]] = None) -> dict:
+    data = await api_learn(species, allow_new=allow_new, file_bytes=file_bytes, embedding=embedding)
+    await _note_bank_version(data.get("bank_version"))
+    return data
 
 
-def _db_insert_learned(species: str, vec: np.ndarray):
-    conn = _db._conn
-    cur = conn.cursor()
-    try:
-        variant = f"{species}{LEARNED_MARK}{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-        cur.execute(
-            "INSERT INTO pokemon_features (species, variant_name, feature_vector, created_at) "
-            "VALUES (?, ?, ?, strftime('%s', 'now'))",
-            (species, variant, json.dumps(vec.tolist())),
-        )
-        cur.execute(
-            "INSERT INTO species_info (species, count, last_updated) "
-            "VALUES (?, 1, strftime('%s', 'now')) "
-            "ON CONFLICT(species) DO UPDATE SET count = count + 1, last_updated = strftime('%s', 'now')",
-            (species,),
-        )
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-
-
-def _learn_sync(name: str, vec: np.ndarray, allow_new: bool = False):
-    """
-    Adds one example to the DB and the in-memory bank.
-    Returns (status, species, extra):
-      ("learned", species, examples_for_species)
-      ("duplicate", species, None)   - bank already has (almost) this exact image
-      ("unknown", None, suggestions) - species not in the bank and allow_new=False
-      ("bad_image", None, None)      - feature extraction failed (zero vector)
-    """
-    global _species_list, _matrix
-    vec = np.asarray(vec, dtype=np.float32).flatten()
-    norm = float(np.linalg.norm(vec))
-    if norm < 1e-6:
-        return "bad_image", None, None
-    vec = vec / norm
-
-    with _bank_lock:
-        species = _find_species(name)
-        if species is None:
-            if not allow_new:
-                close = difflib.get_close_matches(
-                    _new_species_name(name), sorted(set(_species_list)), n=3, cutoff=0.6
-                )
-                return "unknown", None, close
-            species = _new_species_name(name)
-        else:
-            idx = [i for i, s in enumerate(_species_list) if s == species]
-            if idx and float((_matrix[idx] @ vec).max()) >= LEARN_DUP_SIM:
-                return "duplicate", species, None
-
-        _db_insert_learned(species, vec)  # DB first, so memory never gets ahead of it
-        _matrix = np.vstack([_matrix, vec[None, :]])
-        _species_list = _species_list + [species]
-        _cache_clear()
-        return "learned", species, sum(1 for s in _species_list if s == species)
-
-
-def _delete_learned(species: Optional[str] = None, last_only: bool = False):
-    """Removes learned examples (never the original training data). Returns removed species names."""
-    global _species_list, _matrix
-    with _bank_lock:
-        conn = _db._conn
-        cur = conn.cursor()
-        try:
-            query = "SELECT id, species FROM pokemon_features WHERE instr(variant_name, ?) > 0"
-            params = [LEARNED_MARK]
-            if species:
-                query += " AND species = ?"
-                params.append(species)
-            query += " ORDER BY id DESC"
-            if last_only:
-                query += " LIMIT 1"
-            cur.execute(query, params)
-            rows = [(r[0], r[1]) for r in cur.fetchall()]
-            for row_id, sp in rows:
-                cur.execute("DELETE FROM pokemon_features WHERE id = ?", (row_id,))
-                cur.execute("UPDATE species_info SET count = MAX(count - 1, 0) WHERE species = ?", (sp,))
-            conn.commit()
-        finally:
-            try:
-                cur.close()
-            except Exception:
-                pass
-        if rows:
-            _species_list, _matrix = load_feature_bank(_db)
-            _cache_clear()
-        return [sp for _, sp in rows]
-
-
-def _count_learned() -> int:
-    with _bank_lock:
-        cur = _db._conn.cursor()
-        try:
-            cur.execute("SELECT COUNT(*) FROM pokemon_features WHERE instr(variant_name, ?) > 0", (LEARNED_MARK,))
-            return int(cur.fetchone()[0])
-        finally:
-            try:
-                cur.close()
-            except Exception:
-                pass
+async def _forget(*, species: Optional[str] = None, last: bool = False) -> dict:
+    data = await api_forget(species=species, last=last)
+    await _note_bank_version(data.get("bank_version"))
+    return data
 
 
 def _message_text(message: discord.Message) -> str:
@@ -918,26 +764,37 @@ async def _maybe_auto_learn(message: discord.Message):
     caught = match.group(1).strip()
     entry = _last_spawn.get(message.channel.id)
     if not entry:
-        log.info(f"Auto-learn: '{caught}' was caught but I have no analysed spawn for this channel — skipping")
+        log.info(f"Auto-learn: '{caught}' was caught but I have no analysed spawn for this channel - skipping")
         return
     spawned_at, guess, score, vec = entry
     if time.time() - spawned_at > AUTO_LEARN_MAX_AGE:
-        log.info(f"Auto-learn: last spawn is too old to trust — skipping '{caught}'")
+        log.info(f"Auto-learn: last spawn is too old to trust - skipping '{caught}'")
         return
     _last_spawn[message.channel.id] = None  # learn from each spawn at most once
 
-    species = _find_species(caught)
-    if species is None:
-        log.warning(f"Auto-learn: '{caught}' isn't a species in my DB — use s!learn --new {caught.lower()} if it's real")
+    if score >= CONFIDENCE_THRESHOLD and _key(caught) == _key(guess):
+        log.info(f"Auto-learn: guessed {guess} correctly ({score:.3f}) - nothing to learn")
         return
-    if species == guess and score >= CONFIDENCE_THRESHOLD:
-        log.info(f"Auto-learn: guessed {species} correctly ({score:.3f}) — nothing to learn")
+    if vec is None:
+        log.warning("Auto-learn: no embedding available for the last spawn - skipping")
         return
 
-    status, name, extra = await asyncio.to_thread(_learn_sync, species, vec, False)
-    verdict = "wrong" if species != guess else "low confidence"
-    log.info(f"Auto-learn: caught={species}, I guessed {guess} ({score:.3f}, {verdict}) -> {status}"
-             + (f" ({extra} examples now)" if status == "learned" else ""))
+    try:
+        data = await _learn(caught, allow_new=False, embedding=vec)
+    except ApiError as e:
+        log.warning(f"Auto-learn: API rejected '{caught}': {e}")
+        return
+    status = data.get("status")
+    verdict = "wrong" if _key(caught) != _key(guess) else "low confidence"
+    if status == "unknown":
+        suggestions = data.get("suggestions") or []
+        log.warning(f"Auto-learn: '{caught}' isn't a species the API knows - "
+                    f"use s!learn --new {caught.lower()} if it's real"
+                    + (f" (did you mean: {', '.join(suggestions)}?)" if suggestions else ""))
+        return
+    examples = data.get("examples")
+    log.info(f"Auto-learn: caught={caught}, I guessed {guess} ({score:.3f}, {verdict}) -> {status}"
+             + (f" ({examples} examples now)" if status == "learned" else ""))
 
 
 async def _maybe_auto_learn_from_source_bot(message: discord.Message):
@@ -957,45 +814,75 @@ async def _maybe_auto_learn_from_source_bot(message: discord.Message):
         source_conf = None
 
     if source_conf is not None and source_conf < AUTO_LEARN_SOURCE_MIN_CONFIDENCE:
-        log.info(f"Auto-learn (source bot): '{claimed}' only {source_conf:.1%} confident — not trusted enough to learn from")
+        log.info(f"Auto-learn (source bot): '{claimed}' only {source_conf:.1%} confident - not trusted enough")
         return
 
     entry = _last_spawn.get(message.channel.id)
     if not entry:
-        log.info(f"Auto-learn (source bot): '{claimed}' named but I have no analysed spawn for this channel — skipping")
+        log.info(f"Auto-learn (source bot): '{claimed}' named but I have no analysed spawn for this channel - skipping")
         return
     spawned_at, guess, score, vec = entry
     if time.time() - spawned_at > AUTO_LEARN_MAX_AGE:
-        log.info(f"Auto-learn (source bot): last spawn is too old to trust — skipping '{claimed}'")
+        log.info(f"Auto-learn (source bot): last spawn is too old to trust - skipping '{claimed}'")
         return
     _last_spawn[message.channel.id] = None  # learn from each spawn at most once
 
-    species = _find_species(claimed)
-    if species is None:
-        log.warning(f"Auto-learn (source bot): '{claimed}' isn't a species in my DB — use s!learn --new {claimed.lower()} if it's real")
+    if score >= CONFIDENCE_THRESHOLD and _key(claimed) == _key(guess):
+        log.info(f"Auto-learn (source bot): guessed {guess} correctly ({score:.3f}) - nothing to learn")
         return
-    if species == guess and score >= CONFIDENCE_THRESHOLD:
-        log.info(f"Auto-learn (source bot): guessed {species} correctly ({score:.3f}) — nothing to learn")
+    if vec is None:
+        log.warning("Auto-learn (source bot): no embedding available for the last spawn - skipping")
         return
 
-    status, name, extra = await asyncio.to_thread(_learn_sync, species, vec, False)
-    verdict = "wrong" if species != guess else "low confidence"
-    log.info(f"Auto-learn (source bot): {message.author} said {species} ({source_conf if source_conf is not None else '?'}), "
+    try:
+        data = await _learn(claimed, allow_new=False, embedding=vec)
+    except ApiError as e:
+        log.warning(f"Auto-learn (source bot): API rejected '{claimed}': {e}")
+        return
+    status = data.get("status")
+    verdict = "wrong" if _key(claimed) != _key(guess) else "low confidence"
+    if status == "unknown":
+        suggestions = data.get("suggestions") or []
+        log.warning(f"Auto-learn (source bot): '{claimed}' isn't a species the API knows - "
+                    f"use s!learn --new {claimed.lower()} if it's real"
+                    + (f" (did you mean: {', '.join(suggestions)}?)" if suggestions else ""))
+        return
+    examples = data.get("examples")
+    log.info(f"Auto-learn (source bot): {message.author} said {claimed} "
+             f"({source_conf if source_conf is not None else '?'}), "
              f"I guessed {guess} ({score:.3f}, {verdict}) -> {status}"
-             + (f" ({extra} examples now)" if status == "learned" else ""))
+             + (f" ({examples} examples now)" if status == "learned" else ""))
 
 
-# ── Discord events ───────────────────────────────────────────────────────
+# ---- Discord events ---------------------------------------------------------
+
+_last_spawn: Dict[int, Optional[Tuple[float, str, float, Optional[List[float]]]]] = {}
+_spawn_gen: Dict[int, int] = {}
+_saver_started = False
+
 
 @bot.event
 async def on_ready():
-    global _saver_started
+    global _saver_started, _known_bank_version
     await _get_session()
+
+    try:
+        health = await api_health()
+        _known_bank_version = health.get("bank_version")
+        log.info(f"Connected to AI_Model API: {AI_MODEL_API_URL}")
+        log.info(f"   ready={health.get('ready')} backend={health.get('backend')} "
+                 f"vectors={health.get('vectors')} species={health.get('species')}")
+    except Exception as e:
+        log.warning(f"Could not reach AI_Model API at startup ({type(e).__name__}: {e}) - "
+                    f"will keep retrying on each spawn")
+
+    await asyncio.to_thread(_cache_load)
     if CACHE_FILE and CACHE_SIZE > 0 and not _saver_started:
         _saver_started = True
         asyncio.create_task(_cache_saver())
+
     log.info("=" * 60)
-    log.info(f"🤖 Logged in as {bot.user} — scanning for spawns from bot ID {SPAWN_BOT_ID}")
+    log.info(f"Logged in as {bot.user} - scanning for spawns from bot ID {SPAWN_BOT_ID}")
     log.info(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}")
     if AUTO_LEARN:
         source_desc = (
@@ -1050,9 +937,9 @@ async def on_message(message: discord.Message):
     if _spawn_gen.get(cid) != gen:
         return  # superseded while we were working
 
-    winner, score, neighbors, query_vec = result
+    winner, score, neighbors, vec = result
 
-    _last_spawn[message.channel.id] = (time.time(), winner, score, query_vec)
+    _last_spawn[message.channel.id] = (time.time(), winner, score, vec)
 
     elapsed_ms = (time.time() - received) * 1000
     confident = score >= CONFIDENCE_THRESHOLD
@@ -1063,9 +950,9 @@ async def on_message(message: discord.Message):
 
     display_name = _display(winner)
     if confident:
-        reply_text = f"{display_name} — {score * 100:.1f}%"
+        reply_text = f"{display_name} - {score * 100:.1f}%"
     else:
-        reply_text = f"{display_name}? — {score * 100:.1f}% (low confidence, might be wrong)"
+        reply_text = f"{display_name}? - {score * 100:.1f}% (low confidence, might be wrong)"
 
     try:
         await message.reply(reply_text, allowed_mentions=discord.AllowedMentions.none())
@@ -1076,7 +963,7 @@ async def on_message(message: discord.Message):
     _m_add(_m_response, (time.time() - received) * 1000)
 
 
-# ── Manual testing / admin commands ─────────────────────────────────────
+# ---- Manual testing / admin commands ----------------------------------------
 
 async def _resolve_message_image(ctx: commands.Context, no_image_error: str):
     for att in ctx.message.attachments:
@@ -1110,24 +997,30 @@ async def _resolve_message_image(ctx: commands.Context, no_image_error: str):
 async def predict_cmd(ctx: commands.Context):
     """Manually test identification: attach an image or reply to one with s!predict"""
     image_bytes, error = await _resolve_message_image(
-        ctx, no_image_error="⚠️ Attach an image, or reply to a message that has one, when using this command."
+        ctx, no_image_error="Attach an image, or reply to a message that has one, when using this command."
     )
     if image_bytes is None:
         await ctx.send(error)
         return
 
     start = time.time()
-    winner, score, neighbors, _ = await _in_executor(_run_identification, image_bytes)
+    async with ctx.typing():
+        result = await _identify_one(image_bytes)
     elapsed_ms = (time.time() - start) * 1000
 
-    lines = [f"**Best guess:** {_display(winner)} — {score * 100:.1f}%"]
+    if result is None:
+        await ctx.send("Couldn't get a prediction (unreadable image, or the AI_Model API is unreachable - check logs).")
+        return
+    winner, score, neighbors, _ = result
+
+    lines = [f"**Best guess:** {_display(winner)} - {score * 100:.1f}%"]
     lines.append(f"Processed in {elapsed_ms:.0f}ms\n")
     lines.append("**Top matches:**")
     for sp, sim in neighbors:
         lines.append(f"  {sp:<20s} {sim * 100:.1f}%")
 
     embed = discord.Embed(
-        title="🔍 Predict Result",
+        title="Predict Result",
         description="\n".join(lines),
         color=discord.Color.green() if score >= CONFIDENCE_THRESHOLD else discord.Color.orange(),
     )
@@ -1144,149 +1037,143 @@ async def learn_cmd(ctx: commands.Context, *, species: str):
         species = species[6:].strip()
 
     image_bytes, error = await _resolve_message_image(
-        ctx, no_image_error="⚠️ Attach an image, or reply to a spawn/image message, when using s!learn."
+        ctx, no_image_error="Attach an image, or reply to a spawn/image message, when using s!learn."
     )
     if image_bytes is None:
         await ctx.send(error)
         return
 
     try:
-        vec = await asyncio.to_thread(_embed_image_bytes, image_bytes)
-    except Exception as e:
-        await ctx.send(f"❌ Couldn't read that image: {type(e).__name__}")
+        async with ctx.typing():
+            data = await _learn(species, allow_new=allow_new, file_bytes=image_bytes)
+    except ApiError as e:
+        await ctx.send(f"Couldn't save that example: {e}")
         return
-
-    try:
-        status, name, extra = await asyncio.to_thread(_learn_sync, species, vec, allow_new)
     except Exception as e:
         log.error(f"s!learn failed: {type(e).__name__}: {e}")
-        await ctx.send(f"❌ Couldn't save that example: {type(e).__name__}: {e}")
+        await ctx.send(f"Couldn't reach the AI_Model API: {type(e).__name__}: {e}")
         return
 
+    status, name, extra = data.get("status"), data.get("species"), data.get("examples")
     if status == "bad_image":
-        await ctx.send("❌ Couldn't extract features from that image, so nothing was saved.")
+        await ctx.send("Couldn't extract features from that image, so nothing was saved.")
     elif status == "unknown":
-        hint = f" Did you mean: {', '.join(_display(s) for s in extra)}?" if extra else ""
+        suggestions = data.get("suggestions") or []
+        hint = f" Did you mean: {', '.join(_display(s) for s in suggestions)}?" if suggestions else ""
         await ctx.send(
-            f"❓ I don't know a species called **{species}**.{hint}\n"
+            f"I don't know a species called **{species}**.{hint}\n"
             f"If it really is a new species, use `{COMMAND_PREFIX}learn --new {species}`."
         )
     elif status == "duplicate":
-        await ctx.send(f"ℹ️ I already have this exact image saved for **{_display(name)}** — nothing to add.")
+        await ctx.send(f"I already have this exact image saved for **{_display(name)}** - nothing to add.")
     else:
-        _, species_list, matrix = _snapshot()
-        winner, score, _ = _predict(vec, species_list, matrix)
-        log.info(f"Learned 1 example of {name} ({extra} now, {matrix.shape[0]} total)")
-        await ctx.send(
-            f"✅ Learned **{_display(name)}** — now {extra} example(s) for it ({matrix.shape[0]} total).\n"
-            f"This image now identifies as **{_display(winner)}** ({score * 100:.1f}%)."
-        )
+        result = await _identify_one(image_bytes)
+        if result is not None:
+            winner, score, _n, _v = result
+            log.info(f"Learned 1 example of {name} ({extra} now)")
+            await ctx.send(
+                f"Learned **{_display(name)}** - now {extra} example(s) for it.\n"
+                f"This image now identifies as **{_display(winner)}** ({score * 100:.1f}%)."
+            )
+        else:
+            await ctx.send(f"Learned **{_display(name)}** - now {extra} example(s) for it.")
 
 
 @bot.command(name="forget")
 @commands.is_owner()
 async def forget_cmd(ctx: commands.Context, *, species: str):
     """Remove the examples you taught for a species (original training data is never touched)."""
-    found = _find_species(species)
-    if found is None:
-        await ctx.send(f"❓ I don't know a species called **{species}**.")
+    try:
+        data = await _forget(species=species)
+    except ApiError as e:
+        if e.status == 404:
+            suggestions = e.detail.get("suggestions") if isinstance(e.detail, dict) else None
+            hint = f" Did you mean: {', '.join(_display(s) for s in suggestions)}?" if suggestions else ""
+            await ctx.send(f"I don't know a species called **{species}**.{hint}")
+        else:
+            await ctx.send(f"{e}")
         return
-    removed = await asyncio.to_thread(_delete_learned, found, False)
+    removed = data.get("species") or []
     if not removed:
-        await ctx.send(f"ℹ️ No taught examples for **{_display(found)}** (original training data is never deleted).")
+        await ctx.send(f"No taught examples for **{_display(species)}** (original training data is never deleted).")
         return
-    await ctx.send(f"🗑️ Removed {len(removed)} taught example(s) of **{_display(found)}**.")
+    await ctx.send(f"Removed {data.get('removed', len(removed))} taught example(s) of **{_display(removed[0])}**.")
 
 
 @bot.command(name="undo")
 @commands.is_owner()
 async def undo_cmd(ctx: commands.Context):
     """Remove the most recent example that was taught (via s!learn or auto-learn)."""
-    removed = await asyncio.to_thread(_delete_learned, None, True)
-    if not removed:
-        await ctx.send("ℹ️ Nothing to undo — no taught examples found.")
+    try:
+        data = await _forget(last=True)
+    except ApiError as e:
+        await ctx.send(f"{e}")
         return
-    await ctx.send(f"↩️ Removed the latest taught example (**{_display(removed[0])}**).")
+    removed = data.get("species") or []
+    if not removed:
+        await ctx.send("Nothing to undo - no taught examples found.")
+        return
+    await ctx.send(f"Removed the latest taught example (**{_display(removed[0])}**).")
 
 
 @bot.command(name="api")
 @commands.is_owner()
 async def api_cmd(ctx: commands.Context):
     """Live performance dashboard: activity, active incense, inference/response times, cache hit rate."""
-    await ctx.send(embed=_build_api_embed())
-
-
-_torch_reference = None
-
-
-def _compare_sync(image_bytes: bytes):
-    """Embed one image with the active backend AND the PyTorch reference, and match both against the bank."""
-    global _torch_reference
-    extractor, species_list, matrix = _snapshot()
-    if _torch_reference is None:
-        _torch_reference = extractor if not isinstance(extractor, OnnxExtractor) else load_extractor(BOT_MODEL_PATH)
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    v_ref, v_act = _torch_reference.extract(img), extractor.extract(img)
-    cos = float(np.dot(v_ref, v_act) / max(1e-9, float(np.linalg.norm(v_ref) * np.linalg.norm(v_act))))
-    return _predict(v_ref, species_list, matrix), _predict(v_act, species_list, matrix), cos
-
-
-@bot.command(name="compare")
-@commands.is_owner()
-async def compare_cmd(ctx: commands.Context):
-    """Accuracy check: run the active backend and PyTorch on one image (attach it, or reply to it)."""
-    image_bytes, error = await _resolve_message_image(
-        ctx, no_image_error="⚠️ Attach an image, or reply to a message that has one, when using this command."
-    )
-    if image_bytes is None:
-        await ctx.send(error)
-        return
-    async with ctx.typing():
-        (w_ref, s_ref, n_ref), (w_act, s_act, n_act), cos = await _in_executor(_compare_sync, image_bytes)
-    same = w_ref == w_act
-    lines = [
-        f"**Active backend ({_backend_name}):** {_display(w_act)} — {s_act * 100:.2f}%",
-        f"**PyTorch reference:** {_display(w_ref)} — {s_ref * 100:.2f}%",
-        f"**Embedding cosine (1.0 = identical):** {cos:.7f}",
-        f"**Same answer:** {'✅ yes' if same else '❌ NO'}",
-        "", "**Top matches (active):** " + ", ".join(f"{_display(sp)} {sim * 100:.1f}%" for sp, sim in n_act[:3]),
-    ]
-    await ctx.send(embed=discord.Embed(
-        title="🔬 Backend comparison", description="\n".join(lines),
-        color=discord.Color.green() if same else discord.Color.red(),
-    ))
+    await ctx.send(embed=await _build_api_embed())
 
 
 @bot.command(name="stats")
 @commands.is_owner()
 async def stats_cmd(ctx: commands.Context):
-    _, species_list, matrix = _snapshot()
-    learned = await asyncio.to_thread(_count_learned)
+    try:
+        data = await api_stats()
+    except ApiError as e:
+        await ctx.send(f"Couldn't fetch stats from the API: {e}")
+        return
+    except Exception as e:
+        await ctx.send(f"Couldn't reach the AI_Model API: {type(e).__name__}: {e}")
+        return
+    learned = data.get("learned_vectors", "?")
+    settings = data.get("settings", {})
+    counters = data.get("counters", {})
     await ctx.send(
-        f"📊 Loaded **{matrix.shape[0]}** feature vectors across "
-        f"**{len(set(species_list))}** species from the DB "
-        f"(**{learned}** taught by you).\n"
-        f"Cache: `{len(_result_cache)}` results · hits `{_stats['hits']}` · inferences `{_stats['misses']}` · "
-        f"shared `{_stats['coalesced']}` · dropped `{_stats['dropped']}`\n"
-        f"Backend: `{_backend_name}` · workers: `{INFER_WORKERS}` · threads: `{TORCH_THREADS}` · "
+        f"API reports **{data.get('vectors', '?')}** feature vectors across "
+        f"**{data.get('species', '?')}** species (**{learned}** taught).\n"
+        f"Bot-side cache: `{len(_result_cache)}` results - hits `{_stats['hits']}` - "
+        f"API calls `{_stats['misses']}` - shared `{_stats['coalesced']}` - dropped `{_stats['dropped']}`\n"
+        f"Backend: `{data.get('backend', '?')}` - model: `{data.get('model', '?')}` - "
         f"avg batch: `{_stats['batch_items'] / max(1, _stats['batches']):.2f}` (max `{BATCH_MAX}`)\n"
-        f"Model: `{BOT_MODEL_PATH}`\n"
-        f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` · Auto-learn: `{'on (' + AUTO_LEARN_SOURCE + ')' if AUTO_LEARN else 'off'}`"
+        f"API: `{AI_MODEL_API_URL}` - predictions: `{counters.get('predictions', '?')}`\n"
+        f"Confidence threshold: `{CONFIDENCE_THRESHOLD}` (server default `{settings.get('confidence_threshold', '?')}`) - "
+        f"Auto-learn: `{'on (' + AUTO_LEARN_SOURCE + ')' if AUTO_LEARN else 'off'}`"
     )
 
 
 @bot.command(name="reload")
 @commands.is_owner()
 async def reload_cmd(ctx: commands.Context):
-    """Re-load the model + feature bank without restarting the bot (use after retraining)."""
-    await ctx.send("🔄 Reloading model + feature bank ...")
+    """Ask the AI_Model API to re-load its model + feature bank (use after retraining)."""
+    global _known_bank_version
+    await ctx.send("Asking the API to reload its model + feature bank ...")
     try:
-        await asyncio.to_thread(_load_model_and_bank)
-    except Exception as e:
-        await ctx.send(f"❌ Reload failed: {e}")
+        result = await api_reload()
+    except ApiError as e:
+        await ctx.send(f"Reload failed: {e}")
         return
-    _, species_list, matrix = _snapshot()
-    await ctx.send(f"✅ Reloaded — {matrix.shape[0]} features across {len(set(species_list))} species.")
+    except Exception as e:
+        await ctx.send(f"Couldn't reach the AI_Model API: {type(e).__name__}: {e}")
+        return
+    await _cache_clear()
+    try:
+        health = await api_health()
+        _known_bank_version = health.get("bank_version")
+    except Exception:
+        pass
+    await ctx.send(
+        f"Reloaded - {result.get('vectors', '?')} features across {result.get('species', '?')} species."
+        + (f"\nNote: {result['note']}" if result.get("note") else "")
+    )
 
 
 @bot.command(name="threshold")
@@ -1298,12 +1185,10 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
         await ctx.send(f"Current confidence threshold: `{CONFIDENCE_THRESHOLD}`")
         return
     CONFIDENCE_THRESHOLD = value
-    await ctx.send(f"✅ Confidence threshold set to `{CONFIDENCE_THRESHOLD}`")
+    await ctx.send(f"Confidence threshold set to `{CONFIDENCE_THRESHOLD}` (sent to the API on every prediction).")
 
 
 def main():
-    _load_model_and_bank()
-    _cache_load()
     bot.run(DISCORD_TOKEN, log_handler=None)  # we configured logging above (stdout)
 
 
