@@ -135,7 +135,11 @@ SILENT_BELOW_THRESHOLD = os.getenv("SILENT_BELOW_THRESHOLD", "false").lower() ==
 # /v1/predict/batch call, waiting at most BATCH_WAIT_MS for stragglers (0 =
 # only group what's already waiting, so it never adds latency).
 BATCH_MAX = 8
-BATCH_WAIT_MS = 0.0
+# 0 = only group spawns that are already queued at the exact same instant (no added latency).
+# A small non-zero wait lets nearby spawns (e.g. several channels firing within milliseconds of
+# each other) share ONE network round trip to the API instead of each paying it separately -
+# this is the main lever for cutting total round trips without moving either deployment.
+BATCH_WAIT_MS = float(os.getenv("BATCH_WAIT_MS", "30.0"))
 # How many /v1/predict(/batch) calls this bot will have in flight at once.
 API_CONCURRENCY = 32
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
