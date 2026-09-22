@@ -39,6 +39,20 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
                            inference/response times, cache hit rate)
     s!reload             - ask the API to re-load its model + feature bank
     s!threshold X        - view/change the confidence threshold at runtime
+    s!naming [on|off]    - turn spawn identification off/on for this server (persists across restarts)
+    s!backfill [scope] [max_per_channel]
+                         - scan old Poketwo spawn history and self-label it for free:
+                           each spawn's image is confirmed by the species named in the
+                           NEXT spawn's "Wild X fled" message, so every consecutive spawn
+                           pair in the history becomes a training example - no catches
+                           needed. scope is "channel" (default, current channel only),
+                           "guild" (every text channel in this server), or "all" (every
+                           server the bot is in). max_per_channel limits how many
+                           messages back to read per channel (default: all of them).
+                           Add "dry" as a 3rd arg (e.g. s!backfill channel 500 dry) to
+                           preview every (species, image) pair WITHOUT teaching it - every
+                           pair, dry or live, is appended to backfill_audit.csv so you can
+                           spot-check that species text really matches its paired image.
 
 Optional auto-learning (AUTO_LEARN=true): learns from the last spawn in a
 channel if the bot guessed it wrong or wasn't confident. Where the "correct"
@@ -196,6 +210,16 @@ AUTO_LEARN_SOURCE_REGEX = os.getenv(
 AUTO_LEARN_SOURCE_MIN_CONFIDENCE = float(os.getenv("AUTO_LEARN_SOURCE_MIN_CONFIDENCE", "0.9"))
 _AUTO_LEARN_SOURCE_RE = re.compile(AUTO_LEARN_SOURCE_REGEX, re.IGNORECASE) if AUTO_LEARN_SOURCE == "bot" else None
 
+# -- s!backfill --
+# Poketwo (and most clones) name the PREVIOUS spawn when the NEXT one appears:
+# "Wild Glalie fled. A new wild pokemon has appeared!" - so every spawn image
+# is ground-truth-labeled by the very next spawn message in that channel.
+# This lets s!backfill turn a channel's entire history into training data
+# without needing a single catch.
+FLED_REGEX = os.getenv("FLED_REGEX", r"[Ww]ild\s+(.+?)\s+fled")
+_FLED_RE = re.compile(FLED_REGEX)
+BACKFILL_CONCURRENCY = int(os.getenv("BACKFILL_CONCURRENCY", "4"))
+
 if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and not AUTO_LEARN_SOURCE_BOT_ID:
     raise RuntimeError(
         "AUTO_LEARN_SOURCE=bot requires AUTO_LEARN_SOURCE_BOT_ID to be set in your .env "
@@ -208,6 +232,28 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+
+# -- per-guild naming on/off --
+DISABLED_GUILDS_FILE = os.getenv("DISABLED_GUILDS_FILE", "disabled_guilds.json")
+
+def _load_disabled_guilds() -> set:
+    try:
+        with open(DISABLED_GUILDS_FILE, "r") as f:
+            return {int(x) for x in json.load(f)}
+    except FileNotFoundError:
+        return set()
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        log.error(f"Couldn't parse {DISABLED_GUILDS_FILE}, starting with nothing disabled: {e}")
+        return set()
+
+def _save_disabled_guilds() -> None:
+    try:
+        with open(DISABLED_GUILDS_FILE, "w") as f:
+            json.dump(sorted(DISABLED_GUILDS), f)
+    except OSError as e:
+        log.error(f"Failed to save {DISABLED_GUILDS_FILE}: {e}")
+
+DISABLED_GUILDS: set = _load_disabled_guilds()
 
 def _shrink_for_upload(data: bytes) -> bytes:
     """
@@ -1049,6 +1095,9 @@ async def on_message(message: discord.Message):
     global _named_total
     await bot.process_commands(message)
 
+    if message.guild is not None and message.guild.id in DISABLED_GUILDS:
+        return
+
     if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and message.author.id == AUTO_LEARN_SOURCE_BOT_ID:
         try:
             await _maybe_auto_learn_from_source_bot(message)
@@ -1239,6 +1288,184 @@ async def learn_cmd(ctx: commands.Context, *, species: str):
             )
         else:
             await ctx.send(f"Learned **{_display(name)}** - now {extra} example(s) for it.")
+
+
+def _backfill_status_line(stats: dict, channel: discord.abc.GuildChannel) -> str:
+    return (
+        f"Backfill scanning **#{getattr(channel, 'name', channel.id)}** "
+        f"({stats['channels_done']}/{stats['channels_total']} channels)\n"
+        f"Spawns seen: {stats['spawns']:,} | Pairs found: {stats['pairs']:,} | "
+        f"Learned: {stats['learned']:,} | Dup: {stats['duplicate']:,} | "
+        f"Unknown: {stats['unknown']:,} | Errors: {stats['errors']:,}"
+    )
+
+
+_BACKFILL_AUDIT_PATH = os.getenv("BACKFILL_AUDIT_PATH", "backfill_audit.csv")
+_backfill_audit_lock = asyncio.Lock()
+
+
+async def _backfill_audit_log(channel_name: str, message_id: int, species: str, image_url: str, status: str):
+    """Appends every (species, image) pair backfill has ever seen to a CSV, dry-run or not,
+    so you can spot-check real pairs later - open the CSV, click a few image_url values,
+    and eyeball whether they actually show the species column next to them."""
+    row = f'{time.strftime("%Y-%m-%d %H:%M:%S")},{channel_name},{message_id},"{species}",{image_url},{status}\n'
+    async with _backfill_audit_lock:
+        try:
+            new_file = not os.path.exists(_BACKFILL_AUDIT_PATH)
+            with open(_BACKFILL_AUDIT_PATH, "a", encoding="utf-8") as f:
+                if new_file:
+                    f.write("timestamp,channel,message_id,species,image_url,status\n")
+                f.write(row)
+        except OSError as e:
+            log.warning(f"Backfill: couldn't write audit log: {e}")
+
+
+@bot.command(name="backfill")
+@commands.is_owner()
+async def backfill_cmd(ctx: commands.Context, scope: str = "channel", limit: Optional[int] = None,
+                        mode: str = ""):
+    """Scan old spawn history and self-label it (see s!help backfill).
+    s!backfill [channel|guild|all] [max_per_channel] [dry]
+    'dry' logs every (species, image) pair it WOULD learn - to the console and to
+    backfill_audit.csv - without calling /v1/learn, so you can verify the pairing
+    is correct before trusting it at scale."""
+    scope = scope.lower()
+    if scope not in ("channel", "guild", "all"):
+        await ctx.send('Scope must be `channel`, `guild`, or `all` (e.g. `s!backfill guild 20000`).')
+        return
+    dry_run = mode.strip().lower() in ("dry", "dryrun", "dry-run", "preview")
+
+    if scope == "channel":
+        channels = [ctx.channel]
+    elif scope == "guild":
+        if ctx.guild is None:
+            await ctx.send("This isn't a server channel.")
+            return
+        channels = [c for c in ctx.guild.text_channels
+                    if c.permissions_for(ctx.guild.me).read_message_history]
+    else:
+        channels = []
+        for g in bot.guilds:
+            channels += [c for c in g.text_channels if c.permissions_for(g.me).read_message_history]
+
+    if not channels:
+        await ctx.send("No readable text channels found for that scope.")
+        return
+    history_limit = limit if (limit and limit > 0) else None
+
+    stats = {"channels_total": len(channels), "channels_done": 0, "spawns": 0,
+             "pairs": 0, "learned": 0, "duplicate": 0, "unknown": 0, "errors": 0}
+    sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+    status_msg = await ctx.send(f"Backfill starting across {len(channels)} channel(s)...")
+    last_edit = 0.0
+
+    async def _learn_pair(channel_name: str, message_id: int, url: str, species: str):
+        async with sem:
+            if dry_run:
+                log.info(f"Backfill [DRY] #{channel_name}: would learn '{species}' <- {url}")
+                await _backfill_audit_log(channel_name, message_id, species, url, "dry_run")
+                return
+            try:
+                img = await _download(url)
+                if img is None:
+                    stats["errors"] += 1
+                    return
+                small = await asyncio.get_running_loop().run_in_executor(None, _shrink_for_upload, img)
+                data = await _learn(species, allow_new=True, file_bytes=small)
+                status = data.get("status")
+                if status in ("learned", "duplicate", "unknown"):
+                    stats[status] += 1
+                log.info(f"Backfill #{channel_name}: '{species}' <- {url} -> {status}")
+                await _backfill_audit_log(channel_name, message_id, species, url, status)
+            except ApiError as e:
+                stats["errors"] += 1
+                log.warning(f"Backfill: API rejected '{species}' <- {url}: {e}")
+                await _backfill_audit_log(channel_name, message_id, species, url, f"api_error:{e}")
+            except Exception as e:
+                stats["errors"] += 1
+                log.warning(f"Backfill: learn failed for {species!r} <- {url}: {type(e).__name__}: {e}")
+                await _backfill_audit_log(channel_name, message_id, species, url, f"error:{type(e).__name__}")
+
+    for channel in channels:
+        pending_url: Optional[str] = None
+        pending_msg_id: Optional[int] = None
+        tasks: List[asyncio.Task] = []
+        try:
+            async for message in channel.history(limit=history_limit, oldest_first=True):
+                if message.author.id != SPAWN_BOT_ID:
+                    continue
+                if not any(_is_wild_spawn_embed(e) for e in message.embeds):
+                    continue
+                stats["spawns"] += 1
+
+                fled_match = _FLED_RE.search(_message_text(message))
+                if fled_match and pending_url:
+                    species = fled_match.group(1).strip().strip(".!").strip()
+                    if species:
+                        stats["pairs"] += 1
+                        tasks.append(asyncio.create_task(
+                            _learn_pair(getattr(channel, "name", str(channel.id)), pending_msg_id, pending_url, species)
+                        ))
+
+                pending_url = _extract_wild_spawn_image_url(message)
+                pending_msg_id = message.id
+
+                if time.time() - last_edit > 8:
+                    last_edit = time.time()
+                    try:
+                        await status_msg.edit(content=_backfill_status_line(stats, channel))
+                    except discord.HTTPException:
+                        pass
+        except discord.Forbidden:
+            log.warning(f"Backfill: no permission to read history in #{channel}")
+        except Exception as e:
+            log.error(f"Backfill: error scanning #{channel}: {type(e).__name__}: {e}")
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        stats["channels_done"] += 1
+        try:
+            await status_msg.edit(content=_backfill_status_line(stats, channel))
+        except discord.HTTPException:
+            pass
+
+    await ctx.send(
+        f"**Backfill complete** across {stats['channels_total']} channel(s).\n"
+        f"Spawns seen: {stats['spawns']:,} | Pairs found: {stats['pairs']:,} | "
+        f"Learned: {stats['learned']:,} | Already had: {stats['duplicate']:,} | "
+        f"Unknown species: {stats['unknown']:,} | Errors: {stats['errors']:,}\n"
+        + (f"Run `{COMMAND_PREFIX}reload` if the API doesn't pick up new examples automatically."
+           if stats["learned"] else "")
+    )
+
+
+@bot.command(name="naming")
+@commands.is_owner()
+async def naming_cmd(ctx: commands.Context, state: Optional[str] = None):
+    """s!naming [on|off] - turn spawn identification (and auto-learn) on/off for this server.
+    No argument shows the current state."""
+    if ctx.guild is None:
+        await ctx.send("This isn't a server channel.")
+        return
+
+    if state is None:
+        off = ctx.guild.id in DISABLED_GUILDS
+        await ctx.send(f"Naming is currently **{'off' if off else 'on'}** in {ctx.guild.name}.")
+        return
+
+    state = state.lower()
+    if state in ("off", "disable", "false", "0"):
+        if ctx.guild.id not in DISABLED_GUILDS:
+            DISABLED_GUILDS.add(ctx.guild.id)
+            _save_disabled_guilds()
+        await ctx.send(f"Naming turned **off** in {ctx.guild.name}. The bot will ignore spawns here until `{COMMAND_PREFIX}naming on`.")
+    elif state in ("on", "enable", "true", "1"):
+        if ctx.guild.id in DISABLED_GUILDS:
+            DISABLED_GUILDS.discard(ctx.guild.id)
+            _save_disabled_guilds()
+        await ctx.send(f"Naming turned **on** in {ctx.guild.name}.")
+    else:
+        await ctx.send(f"Usage: `{COMMAND_PREFIX}naming on` or `{COMMAND_PREFIX}naming off`.")
 
 
 @bot.command(name="forget")
