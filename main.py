@@ -61,6 +61,7 @@ See .env.example for all auto-learn variables.
 
 import io
 import os
+import math
 import re
 import atexit
 import signal
@@ -134,6 +135,31 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 # of replying with a flagged low-confidence guess. Keep this off while
 # you're first tuning CONFIDENCE_THRESHOLD so you can see real scores.
 SILENT_BELOW_THRESHOLD = os.getenv("SILENT_BELOW_THRESHOLD", "false").lower() == "true"
+
+# TEMPORARY: show a neighbour-agreement "confidence" in replies instead of the raw
+# similarity score. Set SHOW_CONFIDENCE=false in .env to go back to similarity.
+# Only the number that is *displayed* changes; the CONFIDENCE_THRESHOLD check
+# still uses the similarity score.
+SHOW_CONFIDENCE = os.getenv("SHOW_CONFIDENCE", "true").lower() == "true"
+CONFIDENCE_TEMP = float(os.getenv("CONFIDENCE_TEMP", "0.02"))  # smaller = stricter
+
+
+def display_confidence(winner: str, score: float, neighbors) -> float:
+    """
+    Share of the top-k nearest neighbours (weighted by similarity) that belong to
+    the winning species. 1.0 = every close neighbour agrees; it drops when another
+    species has a similar match. Falls back to the similarity score if unavailable.
+    """
+    if not SHOW_CONFIDENCE or not neighbors:
+        return score
+    top = max(sim for _, sim in neighbors)
+    total = won = 0.0
+    for sp, sim in neighbors:
+        w = math.exp((sim - top) / CONFIDENCE_TEMP)
+        total += w
+        if sp == winner:
+            won += w
+    return won / total if total > 0 else score
 
 # ---- Throughput tuning (many channels at once, e.g. 100 incense @ 20s) ----
 # Micro-batching: each worker groups up to BATCH_MAX queued images into one
@@ -1163,9 +1189,9 @@ async def on_message(message: discord.Message):
 
     display_name = _display(winner)
     if confident:
-        reply_text = f"{display_name} - {score * 100:.1f}%"
+        reply_text = f"{display_name} - {display_confidence(winner, score, neighbors) * 100:.1f}%"
     else:
-        reply_text = f"{display_name}? - {score * 100:.1f}% (low confidence, might be wrong)"
+        reply_text = f"{display_name}? - {display_confidence(winner, score, neighbors) * 100:.1f}% (low confidence, might be wrong)"
 
     try:
         await message.reply(reply_text, allowed_mentions=discord.AllowedMentions.none())
@@ -1226,7 +1252,7 @@ async def predict_cmd(ctx: commands.Context):
         return
     winner, score, neighbors, _ = result
 
-    lines = [f"**Best guess:** {_display(winner)} - {score * 100:.1f}%"]
+    lines = [f"**Best guess:** {_display(winner)} - {display_confidence(winner, score, neighbors) * 100:.1f}% (similarity {score * 100:.1f}%)"]
     lines.append(f"Processed in {elapsed_ms:.0f}ms\n")
     lines.append("**Top matches:**")
     for sp, sim in neighbors:
