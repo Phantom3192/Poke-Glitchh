@@ -2,7 +2,7 @@
 main.py - Watches for wild Pokemon spawn messages (e.g. from Poketwo)
 and replies with the species name predicted by the AI_Model API.
 
-How identification works: this bot is now a PURE API CLIENT. It sends the
+How identification works: this bot is a PURE API CLIENT. It sends the
 spawn image (and image-only requests like s!predict / s!learn) as an HTTP
 call to your AI_Model server (server.py from the AI_Model repo), which owns
 the model, ONNX Runtime, and the feature bank ("DB"). This bot does not
@@ -12,6 +12,7 @@ bytes and reads back JSON.
     POST {AI_MODEL_API_URL}/v1/predict        -> single-image identification
     POST {AI_MODEL_API_URL}/v1/predict/batch  -> micro-batched identification
     POST {AI_MODEL_API_URL}/v1/learn          -> teach it a new example
+    POST {AI_MODEL_API_URL}/v1/learn/batch    -> teach many examples in one call
     POST {AI_MODEL_API_URL}/v1/forget         -> remove taught examples
     GET  {AI_MODEL_API_URL}/v1/stats          -> bank size + latency numbers
     GET  {AI_MODEL_API_URL}/health            -> readiness
@@ -35,36 +36,26 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
     s!forget <species>   - remove the examples you taught for that species
     s!undo               - remove the most recent example you taught
     s!stats              - show how many species/features the API has loaded
-    s!api                - live performance dashboard (activity, active incense,
-                           inference/response times, cache hit rate)
+    s!api                - live performance dashboard
     s!reload             - ask the API to re-load its model + feature bank
     s!threshold X        - view/change the confidence threshold at runtime
-    s!naming [on|off]    - turn spawn identification off/on for this server (persists across restarts)
-    s!backfill [scope] [max_per_channel]
-                         - scan old Poketwo spawn history and self-label it for free:
-                           each spawn's image is confirmed by the species named in the
-                           NEXT spawn's "Wild X fled" message, so every consecutive spawn
-                           pair in the history becomes a training example - no catches
-                           needed. scope is "channel" (default, current channel only),
-                           "guild" (every text channel in this server), or "all" (every
-                           server the bot is in). max_per_channel limits how many
-                           messages back to read per channel (default: all of them).
-                           Add "dry" as a 3rd arg (e.g. s!backfill channel 500 dry) to
-                           preview every (species, image) pair WITHOUT teaching it - every
-                           pair, dry or live, is appended to backfill_audit.csv so you can
-                           spot-check that species text really matches its paired image.
+    s!naming [on|off]    - turn spawn identification off/on for this server
+    s!backfill [scope] [max_per_channel] [dry] [fresh] [from:<channel_id>]
+                         - scan old spawn history and self-label it for free.
+                           Runs BACKFILL_CHANNEL_CONCURRENCY channels in parallel,
+                           batches /v1/learn calls BACKFILL_BATCH_SIZE at a time,
+                           and downloads images BACKFILL_DOWNLOAD_CONCURRENCY at
+                           a time - so scan speed is limited only by Discord's
+                           history endpoint, not by the model server.
+                           s!backfill stop  - pause a running backfill (progress
+                                              is checkpointed; re-run the same
+                                              command to resume).
 
 Optional auto-learning (AUTO_LEARN=true): learns from the last spawn in a
 channel if the bot guessed it wrong or wasn't confident. Where the "correct"
 answer comes from is set by AUTO_LEARN_SOURCE:
-    - "catch" (default): the spawn bot's own catch announcement
-      ("... You caught a Level 12 Pikachu!").
-    - "bot": trust another bot's identification message instead (e.g. a
-      second spawn-guessing bot in the same channel). Set AUTO_LEARN_SOURCE_BOT_ID
-      to that bot's Discord user ID, and adjust AUTO_LEARN_SOURCE_REGEX if its
-      message format differs from the default "Species <emoji>: 99.86%" style.
-      AUTO_LEARN_SOURCE_MIN_CONFIDENCE sets how confident that bot must claim
-      to be before it's trusted.
+    - "catch" (default): the spawn bot's own catch announcement.
+    - "bot": trust another bot's identification message instead.
 See .env.example for all auto-learn variables.
 """
 
@@ -127,7 +118,7 @@ if not AI_MODEL_API_URL:
     )
 # Only needed if the AI_Model server was started with API_KEY set.
 AI_MODEL_API_KEY = os.getenv("AI_MODEL_API_KEY", "")
-AI_MODEL_TIMEOUT = 20.0
+AI_MODEL_TIMEOUT = None  # no timeout on bot -> API requests (wait as long as the server needs)
 
 # Default is Poketwo's real bot ID, since that's the most common spawn
 # source. Override via .env if you're scanning a different spawn bot.
@@ -218,7 +209,22 @@ _AUTO_LEARN_SOURCE_RE = re.compile(AUTO_LEARN_SOURCE_REGEX, re.IGNORECASE) if AU
 # without needing a single catch.
 FLED_REGEX = os.getenv("FLED_REGEX", r"[Ww]ild\s+(.+?)\s+fled")
 _FLED_RE = re.compile(FLED_REGEX)
-BACKFILL_CONCURRENCY = int(os.getenv("BACKFILL_CONCURRENCY", "4"))
+
+# Backfill tuning (hardcoded - no .env needed).
+# These are the values that put backfill right at Discord's practical speed
+# ceiling without producing visible rate-limit log spam.
+BACKFILL_CHANNEL_CONCURRENCY = 6        # channels scanned in parallel
+BACKFILL_DOWNLOAD_CONCURRENCY = 16      # concurrent image downloads
+BACKFILL_BATCH_SIZE = 32                # pairs per /v1/learn/batch call
+BACKFILL_QUEUE_MAX = 512                # bounded queue so a fast reader can't OOM
+BACKFILL_CHANNEL_DELAY = 0.25           # seconds between history pages per channel
+
+# Backfill runtime state + checkpoint files.
+_backfill_cancel = False                # set by `s!backfill stop`; checked between messages
+_backfill_active = False                # only one backfill run at a time
+BACKFILL_CHECKPOINT_PATH = os.getenv("BACKFILL_CHECKPOINT_PATH", "backfill_checkpoint.json")
+BACKFILL_CHECKPOINT_INTERVAL = float(os.getenv("BACKFILL_CHECKPOINT_INTERVAL", "10"))
+_backfill_checkpoint_lock = asyncio.Lock()
 
 if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and not AUTO_LEARN_SOURCE_BOT_ID:
     raise RuntimeError(
@@ -304,7 +310,7 @@ async def _api_request(method: str, path: str, **kwargs) -> dict:
     if AI_MODEL_API_KEY:
         headers["X-API-Key"] = AI_MODEL_API_KEY
     url = f"{AI_MODEL_API_URL}{path}"
-    timeout = aiohttp.ClientTimeout(total=AI_MODEL_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None)
     async with _api_sem:
         async with sess.request(method, url, headers=headers, timeout=timeout, **kwargs) as resp:
             ctype = resp.content_type or ""
@@ -356,7 +362,6 @@ async def api_predict_batch(images_bytes: List[bytes], *, threshold: Optional[fl
     body = await _api_request("POST", "/v1/predict/batch", data=form, params=params)
     results = body.get("results") if isinstance(body, dict) else None
     if not isinstance(results, list):
-        # 2xx but not the batch payload: wrong AI_MODEL_API_URL, a proxy/starting page, or an old server.
         snippet = json.dumps(body)[:300] if not isinstance(body, str) else body[:300]
         raise ApiError(200, f"unexpected /v1/predict/batch response (no 'results'): {snippet}")
     out = []
@@ -392,6 +397,27 @@ async def api_learn(species: str, *, allow_new: bool = False,
     return await _api_request("POST", "/v1/learn", data=form)
 
 
+async def api_learn_batch(items: List[Tuple[str, bytes]], *, allow_new: bool = True) -> List[dict]:
+    """
+    POST /v1/learn/batch with up to BACKFILL_BATCH_SIZE (species, image_bytes) pairs.
+    Returns a list of per-item result dicts, same order as `items`.
+    """
+    if not items:
+        return []
+    form = aiohttp.FormData()
+    for species, img_bytes in items:
+        form.add_field("species", species)
+        form.add_field("files", img_bytes, filename="image.jpg", content_type="application/octet-stream")
+    form.add_field("allow_new", "true" if allow_new else "false")
+    body = await _api_request("POST", "/v1/learn/batch", data=form)
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list) or len(results) != len(items):
+        snippet = json.dumps(body)[:300] if not isinstance(body, str) else body[:300]
+        raise ApiError(200, f"unexpected /v1/learn/batch response: {snippet}")
+    await _note_bank_version(body.get("bank_version"))
+    return results
+
+
 async def api_forget(*, species: Optional[str] = None, last: bool = False) -> dict:
     payload: dict = {}
     if species:
@@ -419,12 +445,8 @@ async def _download(url: str) -> Optional[bytes]:
 
 
 # ---- Bank-version tracking (drives cache invalidation) ---------------------
-# Every /v1/predict(/batch), /v1/learn and /v1/forget response carries the
-# API's current bank_version. Whenever it changes (because we taught/forgot
-# something, or someone else did via the API) the cache is stale and gets
-# dropped - there's no local feature matrix to fingerprint anymore.
 _known_bank_version: Optional[int] = None
-_known_bank_fp: Optional[str] = None   # content fingerprint of the API's bank (None = unknown -> don't save the cache)
+_known_bank_fp: Optional[str] = None
 
 
 async def _note_bank_version(version: Optional[int]):
@@ -433,13 +455,12 @@ async def _note_bank_version(version: Optional[int]):
         return
     if _known_bank_version is not None and version != _known_bank_version:
         await _cache_clear()
-        _known_bank_fp = None            # bank changed: cache content is new; learn the new fingerprint
+        _known_bank_fp = None
         asyncio.create_task(_refresh_bank_fp())
     _known_bank_version = version
 
 
 async def _refresh_bank_fp():
-    """Fetch the bank fingerprint after a bank change (only trusted if the version still matches)."""
     global _known_bank_fp
     try:
         h = await api_health()
@@ -451,8 +472,8 @@ async def _refresh_bank_fp():
 
 # ---- Result cache (by image hash) ------------------------------------------
 _cache_lock = asyncio.Lock()
-_result_cache: "OrderedDict[str, tuple]" = OrderedDict()   # sha1(image bytes) -> result tuple
-_url_cache: "OrderedDict[str, str]" = OrderedDict()        # image url -> sha1
+_result_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_url_cache: "OrderedDict[str, str]" = OrderedDict()
 _cache_dirty = False
 _stats = {"hits": 0, "misses": 0, "coalesced": 0, "dropped": 0, "batches": 0, "batch_items": 0}
 
@@ -543,10 +564,10 @@ async def _cache_saver():
 
 
 # ---- s!api metrics (rolling window) ----------------------------------------
-_m_inference: deque = deque()   # (ts, ms) API embed time, one entry per real inference
-_m_store: deque = deque()       # (ts, ms) API feature-bank match time
-_m_response: deque = deque()    # (ts, ms) spawn seen -> reply sent
-_m_spawns: deque = deque()      # (ts, 1)  every spawn seen
+_m_inference: deque = deque()
+_m_store: deque = deque()
+_m_response: deque = deque()
+_m_spawns: deque = deque()
 _channel_last_spawn: Dict[int, float] = {}
 _named_total = 0
 
@@ -571,7 +592,6 @@ def _fmt_ms(v: Optional[float]) -> str:
 
 
 def _activity(rate: float):
-    """rate = spawns/sec over the last minute -> (label, embed colour name)."""
     if rate <= 0:
         return "Idle", "light_grey"
     if rate < 2:
@@ -642,11 +662,6 @@ async def _build_api_embed() -> discord.Embed:
 
 
 def _is_wild_spawn_embed(embed: discord.Embed) -> bool:
-    """
-    Heuristic spawn detector, mirroring how most spawn bots phrase it
-    ("A wild pokemon has appeared!" style embeds). Loosen/tighten this
-    if your target spawn bot phrases things differently.
-    """
     title = (embed.title or "").lower()
     description = (embed.description or "").lower()
     footer_text = (embed.footer.text or "").lower() if embed.footer else ""
@@ -666,9 +681,6 @@ def _extract_wild_spawn_image_url(message: discord.Message) -> Optional[str]:
 
 
 # ---- Identification (via API) ----------------------------------------------
-# A "result" tuple throughout this file is (winner, score, neighbors, embedding),
-# matching the shape the old local-inference code used, so the rest of the bot
-# (auto-learn, caching, display) didn't need to change shape.
 
 def _result_from_predict(data: dict) -> tuple:
     neighbors = [(n["species"], n["score"]) for n in data.get("neighbors", [])]
@@ -679,7 +691,7 @@ async def _identify_one(image_bytes: bytes) -> Optional[tuple]:
     try:
         data = await api_predict(image_bytes, threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN)
     except ApiError as e:
-        if e.status != 422:  # 422 = unreadable image, not worth logging as an error
+        if e.status != 422:
             log.error(f"Predict API error: {e}")
         return None
     except Exception as e:
@@ -745,7 +757,7 @@ async def _batch_worker():
         for image_bytes, entry, fut in batch:
             if fut.done():
                 continue
-            if time.time() - _entry_latest(entry) > MAX_SPAWN_AGE:  # too old to be useful
+            if time.time() - _entry_latest(entry) > MAX_SPAWN_AGE:
                 _stats["dropped"] += 1
                 fut.set_result(None)
                 continue
@@ -773,7 +785,6 @@ async def _batch_worker():
 
 
 async def _submit_identification(image_bytes: bytes, entry: dict):
-    """Queue an image for the (micro-batching) API workers; resolves to a result tuple or None."""
     global _batch_queue
     if _batch_queue is None:
         _batch_queue = asyncio.Queue()
@@ -785,7 +796,7 @@ async def _submit_identification(image_bytes: bytes, entry: dict):
     return await fut
 
 
-_url_blocked_hosts: set = set()   # hosts the server refuses to fetch -> use download+upload for these
+_url_blocked_hosts: set = set()
 
 
 def _url_host(url: str) -> str:
@@ -796,14 +807,13 @@ def _url_host(url: str) -> str:
 
 
 async def _identify_via_server_fetch(url: str, timing: Optional[dict]):
-    """The server downloads + identifies. Returns (result_tuple, sha1) or None (caller falls back)."""
     global URL_MODE
     host = _url_host(url)
     t = time.perf_counter()
     try:
         r = (await api_predict_urls([url], threshold=CONFIDENCE_THRESHOLD, include_embedding=AUTO_LEARN))[0]
     except ApiError as e:
-        if e.status in (404, 405):  # server too old to have /v1/predict/urls
+        if e.status in (404, 405):
             log.warning("API has no /v1/predict/urls - switching to download+upload mode")
             URL_MODE = False
         else:
@@ -834,7 +844,6 @@ _inflight_digest: Dict[str, dict] = {}
 
 
 async def _coalesced(table: Dict[str, dict], key: str, received: float, work, deps=None):
-    """Run work(entry) once per key at a time; concurrent callers with the same key share its result."""
     entry = table.get(key)
     if entry is None:
         entry = {"latest": received, "fut": None, "deps": deps or []}
@@ -861,7 +870,6 @@ async def _coalesced(table: Dict[str, dict], key: str, received: float, work, de
 
 
 async def _identify_spawn(url: str, received: float, timing: Optional[dict] = None):
-    """Returns (winner, score, neighbors, embedding) or None. Cache -> coalesce -> download -> hash -> infer."""
     res = await _cache_get_by_url(url) if URL_CACHE else None
     if res is not None:
         _stats["hits"] += 1
@@ -878,7 +886,7 @@ async def _identify_spawn(url: str, received: float, timing: Optional[dict] = No
                     await _cache_put(digest, res, cache_url)
                 return res
             if timing is not None:
-                timing.pop("api", None)  # failed attempt: don't mix its numbers into the fallback's
+                timing.pop("api", None)
         t_dl = time.perf_counter()
         image_bytes = await _download(url)
         if timing is not None:
@@ -916,7 +924,6 @@ async def _identify_spawn(url: str, received: float, timing: Optional[dict] = No
 # ---- Learning (via API) -----------------------------------------------------
 
 def _key(name: str) -> str:
-    """Loose comparison key so 'Mr. Mime', 'mr_mime' and 'mr._mime' all match."""
     return re.sub(r"[^a-z0-9\u2640\u2642]+", "", name.lower())
 
 
@@ -946,7 +953,6 @@ def _message_text(message: discord.Message) -> str:
 
 
 async def _maybe_auto_learn(message: discord.Message):
-    """If this is a 'X caught a Level N <Species>!' message, learn from the last spawn in the channel."""
     text = _message_text(message)
     if "caught" not in text.lower():
         return
@@ -964,7 +970,7 @@ async def _maybe_auto_learn(message: discord.Message):
     if time.time() - spawned_at > AUTO_LEARN_MAX_AGE:
         log.info(f"Auto-learn: last spawn is too old to trust - skipping '{caught}'")
         return
-    _last_spawn[message.channel.id] = None  # learn from each spawn at most once
+    _last_spawn[message.channel.id] = None
 
     if score >= CONFIDENCE_THRESHOLD and _key(caught) == _key(guess):
         log.info(f"Auto-learn: guessed {guess} correctly ({score:.3f}) - nothing to learn")
@@ -992,9 +998,6 @@ async def _maybe_auto_learn(message: discord.Message):
 
 
 async def _maybe_auto_learn_from_source_bot(message: discord.Message):
-    """AUTO_LEARN_SOURCE=bot: trust AUTO_LEARN_SOURCE_BOT_ID's identification
-    message as ground truth and learn from the last spawn in this channel if
-    our own guess disagreed with it (or wasn't confident)."""
     text = _message_text(message)
     match = _AUTO_LEARN_SOURCE_RE.search(text)
     if not match:
@@ -1019,7 +1022,7 @@ async def _maybe_auto_learn_from_source_bot(message: discord.Message):
     if time.time() - spawned_at > AUTO_LEARN_MAX_AGE:
         log.info(f"Auto-learn (source bot): last spawn is too old to trust - skipping '{claimed}'")
         return
-    _last_spawn[message.channel.id] = None  # learn from each spawn at most once
+    _last_spawn[message.channel.id] = None
 
     if score >= CONFIDENCE_THRESHOLD and _key(claimed) == _key(guess):
         log.info(f"Auto-learn (source bot): guessed {guess} correctly ({score:.3f}) - nothing to learn")
@@ -1087,6 +1090,8 @@ async def on_ready():
     else:
         source_desc = "OFF"
     log.info(f"   Auto-learn: {source_desc}")
+    log.info(f"   Backfill: channels={BACKFILL_CHANNEL_CONCURRENCY}, "
+             f"downloads={BACKFILL_DOWNLOAD_CONCURRENCY}, batch={BACKFILL_BATCH_SIZE}")
     log.info("=" * 60)
 
 
@@ -1122,11 +1127,8 @@ async def on_message(message: discord.Message):
     _m_add(_m_spawns, 1)
     _channel_last_spawn[cid] = received
     gen = _spawn_gen.get(cid, 0) + 1
-    _spawn_gen[cid] = gen  # a newer spawn in this channel supersedes this one if it's still working
+    _spawn_gen[cid] = gen
 
-    # A new spawn replaces the old one, so forget the previous spawn now; it's
-    # only re-set below if we manage to analyse this one (avoids learning a
-    # catch against the wrong image).
     _last_spawn[cid] = None
 
     timing: dict = {}
@@ -1134,7 +1136,7 @@ async def on_message(message: discord.Message):
     if result is None:
         return
     if _spawn_gen.get(cid) != gen:
-        return  # superseded while we were working
+        return
 
     winner, score, neighbors, vec = result
 
@@ -1320,20 +1322,75 @@ async def _backfill_audit_log(channel_name: str, message_id: int, species: str, 
             log.warning(f"Backfill: couldn't write audit log: {e}")
 
 
+def _load_backfill_checkpoint() -> dict:
+    try:
+        with open(BACKFILL_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        log.error(f"Couldn't parse {BACKFILL_CHECKPOINT_PATH}, starting with no checkpoint: {e}")
+        return {}
+
+
+async def _save_backfill_checkpoint(checkpoint: dict) -> None:
+    """Atomic write (tmp file + rename) so a crash mid-save can't corrupt the checkpoint file."""
+    async with _backfill_checkpoint_lock:
+        try:
+            tmp = BACKFILL_CHECKPOINT_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(checkpoint, f)
+            os.replace(tmp, BACKFILL_CHECKPOINT_PATH)
+        except OSError as e:
+            log.warning(f"Backfill: couldn't save checkpoint: {e}")
+
+
 @bot.command(name="backfill")
 @commands.is_owner()
 async def backfill_cmd(ctx: commands.Context, scope: str = "channel", limit: Optional[int] = None,
-                        mode: str = ""):
+                        *flags: str):
     """Scan old spawn history and self-label it (see s!help backfill).
-    s!backfill [channel|guild|all] [max_per_channel] [dry]
-    'dry' logs every (species, image) pair it WOULD learn - to the console and to
-    backfill_audit.csv - without calling /v1/learn, so you can verify the pairing
-    is correct before trusting it at scale."""
+    s!backfill [channel|guild|all] [max_per_channel] [dry] [fresh] [from:<channel_id>]
+    s!backfill stop - pause a running backfill; progress is checkpointed.
+
+    Reads BACKFILL_CHANNEL_CONCURRENCY channels in parallel and batches
+    /v1/learn calls BACKFILL_BATCH_SIZE at a time, so scan speed is limited by
+    Discord's history endpoint, not by the model server.
+    """
+    global _backfill_cancel, _backfill_active
+
     scope = scope.lower()
+    if scope in ("stop", "cancel", "pause"):
+        if not _backfill_active:
+            await ctx.send("No backfill is currently running.")
+            return
+        _backfill_cancel = True
+        await ctx.send("Stopping... it'll finish the message it's on, save a checkpoint, then stop. "
+                        f"Run `{COMMAND_PREFIX}backfill` again later (same scope) to resume from there.")
+        return
+
+    if _backfill_active:
+        await ctx.send(f"A backfill is already running. Use `{COMMAND_PREFIX}backfill stop` to pause it first.")
+        return
+
     if scope not in ("channel", "guild", "all"):
         await ctx.send('Scope must be `channel`, `guild`, or `all` (e.g. `s!backfill guild 20000`).')
         return
-    dry_run = mode.strip().lower() in ("dry", "dryrun", "dry-run", "preview")
+
+    flag_words = {f.strip().lower() for f in flags}
+    dry_run = bool(flag_words & {"dry", "dryrun", "dry-run", "preview"})
+    fresh = bool(flag_words & {"fresh", "restart", "reset"})
+
+    start_channel_id: Optional[int] = None
+    for f in flags:
+        fl = f.strip().lower()
+        if fl.startswith(("from:", "from=", "start:", "start=")):
+            _, _, val = fl.partition(":") if ":" in fl else fl.partition("=")
+            try:
+                start_channel_id = int(val.strip())
+            except ValueError:
+                await ctx.send(f"Couldn't read a channel ID out of `{f}` - expected e.g. `from:1490688685342068766`.")
+                return
 
     if scope == "channel":
         channels = [ctx.channel]
@@ -1348,102 +1405,249 @@ async def backfill_cmd(ctx: commands.Context, scope: str = "channel", limit: Opt
         for g in bot.guilds:
             channels += [c for c in g.text_channels if c.permissions_for(g.me).read_message_history]
 
+    if start_channel_id is not None:
+        idx = next((i for i, c in enumerate(channels) if c.id == start_channel_id), None)
+        if idx is None:
+            await ctx.send(
+                f"Couldn't find channel `{start_channel_id}` in scope `{scope}` "
+                f"(wrong ID, no read-history permission, wrong server, or not a text channel)."
+            )
+            return
+        skipped = channels[:idx]
+        channels = channels[idx:]
+        if skipped:
+            await ctx.send(f"Skipping {len(skipped)} channel(s) before <#{start_channel_id}> "
+                            f"(not touched, not marked done - just left alone this run).")
+
     if not channels:
         await ctx.send("No readable text channels found for that scope.")
         return
     history_limit = limit if (limit and limit > 0) else None
 
+    checkpoint = {} if fresh else _load_backfill_checkpoint()
+    resuming = (not fresh) and any(str(c.id) in checkpoint for c in channels)
+
     stats = {"channels_total": len(channels), "channels_done": 0, "spawns": 0,
              "pairs": 0, "learned": 0, "duplicate": 0, "unknown": 0, "errors": 0}
-    sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
-    status_msg = await ctx.send(f"Backfill starting across {len(channels)} channel(s)...")
-    last_edit = 0.0
 
-    async def _learn_pair(channel_name: str, message_id: int, url: str, species: str):
-        async with sem:
-            if dry_run:
-                log.info(f"Backfill [DRY] #{channel_name}: would learn '{species}' <- {url}")
-                await _backfill_audit_log(channel_name, message_id, species, url, "dry_run")
-                return
+    status_msg = await ctx.send(
+        f"Backfill starting across {len(channels)} channel(s) "
+        f"(channel_concurrency={BACKFILL_CHANNEL_CONCURRENCY}, batch={BACKFILL_BATCH_SIZE})"
+        f"{' (resuming from checkpoint)' if resuming else ''}..."
+    )
+    last_edit = 0.0
+    _backfill_cancel = False
+    _backfill_active = True
+
+    # ---- shared queue + batch workers -----------------------------------
+    pair_queue: asyncio.Queue = asyncio.Queue(maxsize=BACKFILL_QUEUE_MAX)
+    download_sem = asyncio.Semaphore(BACKFILL_DOWNLOAD_CONCURRENCY)
+    workers_stop = asyncio.Event()
+
+    def _bump(status: str):
+        if status in stats:
+            stats[status] += 1
+        else:
+            stats["errors"] += 1
+
+    async def _process_item(channel_name: str, message_id: int, url: str, species: str):
+        """Download + resize one image. Returns (species, bytes) or None on failure."""
+        async with download_sem:
             try:
                 img = await _download(url)
-                if img is None:
-                    stats["errors"] += 1
-                    return
-                small = await asyncio.get_running_loop().run_in_executor(None, _shrink_for_upload, img)
-                data = await _learn(species, allow_new=True, file_bytes=small)
-                status = data.get("status")
-                if status in ("learned", "duplicate", "unknown"):
-                    stats[status] += 1
-                log.info(f"Backfill #{channel_name}: '{species}' <- {url} -> {status}")
-                await _backfill_audit_log(channel_name, message_id, species, url, status)
-            except ApiError as e:
-                stats["errors"] += 1
-                log.warning(f"Backfill: API rejected '{species}' <- {url}: {e}")
-                await _backfill_audit_log(channel_name, message_id, species, url, f"api_error:{e}")
             except Exception as e:
                 stats["errors"] += 1
-                log.warning(f"Backfill: learn failed for {species!r} <- {url}: {type(e).__name__}: {e}")
-                await _backfill_audit_log(channel_name, message_id, species, url, f"error:{type(e).__name__}")
-
-    for channel in channels:
-        pending_url: Optional[str] = None
-        pending_msg_id: Optional[int] = None
-        tasks: List[asyncio.Task] = []
+                log.warning(f"Backfill: download failed for {url}: {type(e).__name__}: {e}")
+                await _backfill_audit_log(channel_name, message_id, species, url, "error:download")
+                return None
+        if img is None:
+            stats["errors"] += 1
+            await _backfill_audit_log(channel_name, message_id, species, url, "error:download_none")
+            return None
         try:
-            async for message in channel.history(limit=history_limit, oldest_first=True):
-                if message.author.id != SPAWN_BOT_ID:
+            small = await asyncio.get_running_loop().run_in_executor(None, _shrink_for_upload, img)
+        except Exception:
+            small = img
+        return species, small
+
+    async def _batch_worker(worker_id: int):
+        """Pulls up to BACKFILL_BATCH_SIZE items from the queue, submits them in one call."""
+        while not workers_stop.is_set():
+            try:
+                first = await asyncio.wait_for(pair_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+            batch_meta = [first]
+            while len(batch_meta) < BACKFILL_BATCH_SIZE:
+                try:
+                    batch_meta.append(pair_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            if dry_run:
+                for channel_name, message_id, url, species in batch_meta:
+                    log.info(f"Backfill [DRY] #{channel_name}: would learn '{species}' <- {url}")
+                    await _backfill_audit_log(channel_name, message_id, species, url, "dry_run")
+                continue
+
+            results = await asyncio.gather(
+                *(_process_item(cn, mid, u, sp) for cn, mid, u, sp in batch_meta),
+                return_exceptions=False,
+            )
+            items_for_learn = []
+            kept_meta = []
+            for meta, res in zip(batch_meta, results):
+                if res is None:
                     continue
-                if not any(_is_wild_spawn_embed(e) for e in message.embeds):
-                    continue
-                stats["spawns"] += 1
+                items_for_learn.append(res)
+                kept_meta.append(meta)
 
-                fled_match = _FLED_RE.search(_message_text(message))
-                if fled_match and pending_url:
-                    species = fled_match.group(1).strip().strip(".!").strip()
-                    if species:
-                        stats["pairs"] += 1
-                        tasks.append(asyncio.create_task(
-                            _learn_pair(getattr(channel, "name", str(channel.id)), pending_msg_id, pending_url, species)
-                        ))
+            if not items_for_learn:
+                continue
 
-                pending_url = _extract_wild_spawn_image_url(message)
-                pending_msg_id = message.id
+            try:
+                api_results = await api_learn_batch(items_for_learn, allow_new=True)
+            except Exception as e:
+                stats["errors"] += len(items_for_learn)
+                log.warning(f"Backfill: /v1/learn/batch failed ({type(e).__name__}: {e})")
+                for cn, mid, u, sp in kept_meta:
+                    await _backfill_audit_log(cn, mid, sp, u, "error:api")
+                continue
 
-                if time.time() - last_edit > 8:
-                    last_edit = time.time()
-                    try:
-                        await status_msg.edit(content=_backfill_status_line(stats, channel))
-                    except discord.HTTPException:
-                        pass
+            for (cn, mid, u, sp), r in zip(kept_meta, api_results):
+                status = r.get("status", "error")
+                _bump(status)
+                log.info(f"Backfill #{cn}: '{sp}' -> {status}")
+                await _backfill_audit_log(cn, mid, sp, u, status)
+
+    # ---- per-channel scanner -------------------------------------------
+    async def _scan_channel(channel) -> bool:
+        key = str(channel.id)
+        entry = checkpoint.get(key)
+        if entry and entry.get("done") and not fresh:
+            stats["channels_done"] += 1
+            return True
+
+        pending_url: Optional[str] = entry.get("pending_url") if entry else None
+        pending_msg_id: Optional[int] = entry.get("pending_msg_id") if entry else None
+        last_seen_id: Optional[int] = entry.get("last_message_id") if entry else None
+        after_obj = discord.Object(id=last_seen_id) if last_seen_id else None
+        cancelled = False
+
+        try:
+            async for message in channel.history(limit=history_limit, oldest_first=True, after=after_obj):
+                if _backfill_cancel:
+                    cancelled = True
+                    break
+                last_seen_id = message.id
+
+                if message.author.id == SPAWN_BOT_ID and any(_is_wild_spawn_embed(e) for e in message.embeds):
+                    stats["spawns"] += 1
+                    fled_match = _FLED_RE.search(_message_text(message))
+                    if fled_match and pending_url:
+                        species = fled_match.group(1).strip().strip(".!").strip()
+                        if species:
+                            stats["pairs"] += 1
+                            await pair_queue.put(
+                                (getattr(channel, "name", str(channel.id)), pending_msg_id, pending_url, species)
+                            )
+                    pending_url = _extract_wild_spawn_image_url(message)
+                    pending_msg_id = message.id
+
+                if BACKFILL_CHANNEL_DELAY > 0 and last_seen_id and (last_seen_id % 100 == 0):
+                    await asyncio.sleep(BACKFILL_CHANNEL_DELAY)
+
         except discord.Forbidden:
-            log.warning(f"Backfill: no permission to read history in #{channel}")
+            log.warning(f"Backfill: no permission to read history in #{getattr(channel, 'name', channel.id)}")
         except Exception as e:
-            log.error(f"Backfill: error scanning #{channel}: {type(e).__name__}: {e}")
+            log.error(f"Backfill: error scanning #{getattr(channel, 'name', channel.id)}: {type(e).__name__}: {e}")
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        stats["channels_done"] += 1
-        try:
-            await status_msg.edit(content=_backfill_status_line(stats, channel))
-        except discord.HTTPException:
-            pass
+        checkpoint[key] = {"last_message_id": last_seen_id, "pending_url": pending_url,
+                           "pending_msg_id": pending_msg_id, "done": not cancelled}
+        await _save_backfill_checkpoint(checkpoint)
 
-    await ctx.send(
-        f"**Backfill complete** across {stats['channels_total']} channel(s).\n"
-        f"Spawns seen: {stats['spawns']:,} | Pairs found: {stats['pairs']:,} | "
-        f"Learned: {stats['learned']:,} | Already had: {stats['duplicate']:,} | "
-        f"Unknown species: {stats['unknown']:,} | Errors: {stats['errors']:,}\n"
-        + (f"Run `{COMMAND_PREFIX}reload` if the API doesn't pick up new examples automatically."
-           if stats["learned"] else "")
-    )
+        if not cancelled:
+            stats["channels_done"] += 1
+        return not cancelled
+
+    # ---- orchestrator ---------------------------------------------------
+    worker_tasks = [asyncio.create_task(_batch_worker(i))
+                    for i in range(max(1, BACKFILL_CHANNEL_CONCURRENCY))]
+
+    channel_sem = asyncio.Semaphore(max(1, BACKFILL_CHANNEL_CONCURRENCY))
+
+    async def _guarded_scan(channel):
+        async with channel_sem:
+            ok = await _scan_channel(channel)
+            return channel, ok
+
+    try:
+        scan_tasks = [asyncio.create_task(_guarded_scan(c)) for c in channels]
+        pending_scans = set(scan_tasks)
+        cancelled_any = False
+        while pending_scans:
+            done, pending_scans = await asyncio.wait(
+                pending_scans, timeout=8, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in done:
+                try:
+                    channel, ok = t.result()
+                    if not ok:
+                        cancelled_any = True
+                except Exception as e:
+                    log.error(f"Backfill: channel task crashed: {type(e).__name__}: {e}")
+            try:
+                any_channel = channels[0] if channels else ctx.channel
+                await status_msg.edit(content=_backfill_status_line(stats, any_channel))
+            except discord.HTTPException:
+                pass
+
+        while not pair_queue.empty():
+            await asyncio.sleep(0.5)
+            try:
+                any_channel = channels[0] if channels else ctx.channel
+                await status_msg.edit(content=_backfill_status_line(stats, any_channel))
+            except discord.HTTPException:
+                pass
+
+        await asyncio.sleep(1.0)
+
+        if cancelled_any or _backfill_cancel:
+            await ctx.send(
+                f"**Backfill stopped** (checkpoint saved).\n"
+                f"Spawns seen: {stats['spawns']:,} | Pairs found: {stats['pairs']:,} | "
+                f"Learned: {stats['learned']:,} | Already had: {stats['duplicate']:,} | "
+                f"Unknown species: {stats['unknown']:,} | Errors: {stats['errors']:,}\n"
+                f"Run `{COMMAND_PREFIX}backfill {scope}"
+                f"{' ' + str(limit) if limit else ''}` to resume from here, "
+                f"or add `fresh` to start that channel over."
+            )
+            return
+
+        await ctx.send(
+            f"**Backfill complete** across {stats['channels_total']} channel(s).\n"
+            f"Spawns seen: {stats['spawns']:,} | Pairs found: {stats['pairs']:,} | "
+            f"Learned: {stats['learned']:,} | Already had: {stats['duplicate']:,} | "
+            f"Unknown species: {stats['unknown']:,} | Errors: {stats['errors']:,}\n"
+            + (f"Run `{COMMAND_PREFIX}reload` if the API doesn't pick up new examples automatically."
+               if stats["learned"] else "")
+        )
+        for channel in channels:
+            checkpoint.pop(str(channel.id), None)
+        await _save_backfill_checkpoint(checkpoint)
+    finally:
+        workers_stop.set()
+        for t in worker_tasks:
+            t.cancel()
+        _backfill_active = False
 
 
 @bot.command(name="naming")
 @commands.is_owner()
 async def naming_cmd(ctx: commands.Context, state: Optional[str] = None):
-    """s!naming [on|off] - turn spawn identification (and auto-learn) on/off for this server.
-    No argument shows the current state."""
+    """s!naming [on|off] - turn spawn identification (and auto-learn) on/off for this server."""
     if ctx.guild is None:
         await ctx.send("This isn't a server channel.")
         return
@@ -1471,7 +1675,7 @@ async def naming_cmd(ctx: commands.Context, state: Optional[str] = None):
 @bot.command(name="forget")
 @commands.is_owner()
 async def forget_cmd(ctx: commands.Context, *, species: str):
-    """Remove the examples you taught for a species (original training data is never touched)."""
+    """Remove the examples you taught for a species."""
     try:
         data = await _forget(species=species)
     except ApiError as e:
@@ -1492,7 +1696,7 @@ async def forget_cmd(ctx: commands.Context, *, species: str):
 @bot.command(name="undo")
 @commands.is_owner()
 async def undo_cmd(ctx: commands.Context):
-    """Remove the most recent example that was taught (via s!learn or auto-learn)."""
+    """Remove the most recent example that was taught."""
     try:
         data = await _forget(last=True)
     except ApiError as e:
@@ -1508,7 +1712,7 @@ async def undo_cmd(ctx: commands.Context):
 @bot.command(name="api")
 @commands.is_owner()
 async def api_cmd(ctx: commands.Context):
-    """Live performance dashboard: activity, active incense, inference/response times, cache hit rate."""
+    """Live performance dashboard."""
     await ctx.send(embed=await _build_api_embed())
 
 
@@ -1542,7 +1746,7 @@ async def stats_cmd(ctx: commands.Context):
 @bot.command(name="reload")
 @commands.is_owner()
 async def reload_cmd(ctx: commands.Context):
-    """Ask the AI_Model API to re-load its model + feature bank (use after retraining)."""
+    """Ask the AI_Model API to re-load its model + feature bank."""
     global _known_bank_version, _known_bank_fp
     await ctx.send("Asking the API to reload its model + feature bank ...")
     try:
@@ -1579,16 +1783,16 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
 
 
 def _on_sigterm(signum, frame):
-    raise SystemExit(0)  # unwinds bot.run() so the atexit cache save runs on a panel "stop"
+    raise SystemExit(0)
 
 
 def main():
-    atexit.register(_cache_save)  # don't lose the last few seconds of cache on a restart/stop
+    atexit.register(_cache_save)
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except (ValueError, OSError):
         pass
-    bot.run(DISCORD_TOKEN, log_handler=None)  # we configured logging above (stdout)
+    bot.run(DISCORD_TOKEN, log_handler=None)
 
 
 if __name__ == "__main__":
