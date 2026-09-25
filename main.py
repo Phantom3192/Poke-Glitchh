@@ -15,6 +15,7 @@ bytes and reads back JSON.
     POST {AI_MODEL_API_URL}/v1/learn/batch    -> teach many examples in one call
     POST {AI_MODEL_API_URL}/v1/forget         -> remove taught examples
     GET  {AI_MODEL_API_URL}/v1/stats          -> bank size + latency numbers
+    GET  {AI_MODEL_API_URL}/v1/species        -> per-species taught-image counts
     GET  {AI_MODEL_API_URL}/health            -> readiness
     POST {AI_MODEL_API_URL}/admin/reload      -> re-read model + feature bank
 
@@ -35,6 +36,8 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
                            (new species: s!learn --new <n>)
     s!forget <species>   - remove the examples you taught for that species
     s!undo               - remove the most recent example you taught
+    s!checklist [search] - browse per-species image counts ("Charizard - 1000
+                           images"), searchable, sortable high/low via buttons
     s!stats              - show how many species/features the API has loaded
     s!api                - live performance dashboard
     s!reload             - ask the API to re-load its model + feature bank
@@ -362,6 +365,11 @@ async def api_health() -> dict:
 
 async def api_stats() -> dict:
     return await _api_request("GET", "/v1/stats")
+
+
+async def api_species_counts() -> dict:
+    """GET /v1/species -> {"species": {name: image_count, ...}, "total_species": N, "total_vectors": N}"""
+    return await _api_request("GET", "/v1/species")
 
 
 async def api_predict(image_bytes: bytes, *, threshold: Optional[float] = None,
@@ -1731,6 +1739,174 @@ async def undo_cmd(ctx: commands.Context):
 async def api_cmd(ctx: commands.Context):
     """Live performance dashboard."""
     await ctx.send(embed=await _build_api_embed())
+
+
+CHECKLIST_PAGE_SIZE = 15
+
+
+def _pretty_species(name: str) -> str:
+    return name.replace("_", " ").replace("-", " ").title()
+
+
+class _ChecklistSearchModal(discord.ui.Modal, title="Search Pokedex Checklist"):
+    query = discord.ui.TextInput(
+        label="Name contains...",
+        placeholder="e.g. char, pika, eevee (leave blank to clear)",
+        required=False,
+        max_length=64,
+    )
+
+    def __init__(self, view: "ChecklistView"):
+        super().__init__()
+        self.checklist_view = view
+        self.query.default = view.search or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.checklist_view.search = self.query.value.strip() or None
+        self.checklist_view.page = 0
+        await self.checklist_view.refresh(interaction)
+
+
+class ChecklistView(discord.ui.View):
+    """
+    Interactive browser for s!checklist: search by name, sort by image
+    count (ascending/descending), and page through the results.
+    """
+
+    def __init__(self, owner_id: int, counts: Dict[str, int], *, timeout: float = 180.0):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.all_counts = counts  # species -> taught image count (unfiltered)
+        self.search: Optional[str] = None
+        self.descending = True  # True = highest image count first
+        self.page = 0
+        self.message: Optional[discord.Message] = None
+        self._sync_buttons()
+
+    def _filtered_sorted(self) -> List[Tuple[str, int]]:
+        items = list(self.all_counts.items())
+        if self.search:
+            q = self.search.lower()
+            items = [(sp, n) for sp, n in items if q in sp.lower()]
+        # Secondary key keeps ties in a stable, readable (alphabetical) order.
+        items.sort(key=lambda kv: (kv[1], kv[0].lower()), reverse=self.descending)
+        return items
+
+    def _sync_buttons(self):
+        self.sort_button.label = "Highest first" if self.descending else "Lowest first"
+        self.sort_button.emoji = "🔽" if self.descending else "🔼"
+        self.search_button.label = f'Search: "{self.search}"' if self.search else "Search"
+        self.clear_button.disabled = self.search is None
+
+    def build_embed(self) -> discord.Embed:
+        items = self._filtered_sorted()
+        total = len(items)
+        pages = max(1, math.ceil(total / CHECKLIST_PAGE_SIZE))
+        self.page = max(0, min(self.page, pages - 1))
+        start = self.page * CHECKLIST_PAGE_SIZE
+        chunk = items[start:start + CHECKLIST_PAGE_SIZE]
+
+        self.prev_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= pages - 1
+
+        title = "Pokedex Checklist"
+        if self.search:
+            title += f' - matching "{self.search}"'
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
+
+        if not chunk:
+            embed.description = "No Pokemon match that search." if self.search else "Nothing taught yet."
+        else:
+            embed.description = "\n".join(
+                f"**{_pretty_species(sp)}** - {n:,} image{'s' if n != 1 else ''}" for sp, n in chunk
+            )
+
+        order = "highest to lowest" if self.descending else "lowest to highest"
+        scope = f" (of {len(self.all_counts):,} total)" if self.search else ""
+        embed.set_footer(text=f"Page {self.page + 1}/{pages} - {total:,} species{scope} - sorted {order}")
+        self._sync_buttons()
+        return embed
+
+    async def refresh(self, interaction: discord.Interaction):
+        embed = self.build_embed()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran s!checklist can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, emoji="⬅")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, emoji="➡")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Highest first", style=discord.ButtonStyle.primary, emoji="🔽")
+    async def sort_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.descending = not self.descending
+        self.page = 0
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Search", style=discord.ButtonStyle.success, emoji="🔍")
+    async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_ChecklistSearchModal(self))
+
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.danger, emoji="✖", disabled=True)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.search = None
+        self.page = 0
+        await self.refresh(interaction)
+
+
+@bot.command(name="checklist", aliases=["dex", "pokedex"])
+@commands.is_owner()
+async def checklist_cmd(ctx: commands.Context, *, search: Optional[str] = None):
+    """
+    Browse per-species taught-image counts, e.g. "Charizard - 1000 images".
+    s!checklist            - full list, most images first
+    s!checklist charizard  - only species with "charizard" in the name
+    Buttons on the message let you flip Highest/Lowest-first sort, search
+    without retyping the command, and page through the results.
+    """
+    try:
+        data = await api_species_counts()
+    except ApiError as e:
+        await ctx.send(f"Couldn't fetch the species list from the API: {e}")
+        return
+    except Exception as e:
+        await ctx.send(f"Couldn't reach the AI_Model API: {type(e).__name__}: {e}")
+        return
+
+    counts = data.get("species")
+    if not isinstance(counts, dict) or not counts:
+        await ctx.send("The API doesn't know any species yet (empty feature bank).")
+        return
+
+    view = ChecklistView(ctx.author.id, counts)
+    if search:
+        view.search = search.strip() or None
+    embed = view.build_embed()
+    view.message = await ctx.send(embed=embed, view=view)
 
 
 @bot.command(name="stats")
