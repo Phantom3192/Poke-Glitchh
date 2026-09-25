@@ -1170,18 +1170,9 @@ async def on_message(message: discord.Message):
 
     elapsed_ms = (time.time() - received) * 1000
     confident = score >= CONFIDENCE_THRESHOLD
-    parts = []
-    if "dl" in timing:
-        parts.append(f"dl {timing['dl']:.0f}")
-    if "t_queue" in timing:
-        parts.append(f"queue {timing['t_queue']:.0f}")
-    if "api" in timing:
-        fetch = f", fetch {timing['fetch']:.0f}" if "fetch" in timing else ""
-        parts.append(f"api {timing['api']:.0f} (srv {timing.get('srv', 0):.0f}{fetch})")
-    if "n" in timing:
-        parts.append(f"batch {timing['n']}")
-    parts.append("server-fetch" if "fetch" in timing else (f"up {timing['kb']:.0f}KB" if "kb" in timing else "cached"))
-    detail = " [" + " | ".join(parts) + "]"
+    api_ms = timing.get("api", 0.0)
+    bot_ms = max(elapsed_ms - api_ms, 0.0)
+    detail = f" (bot analysis {bot_ms:.0f}ms, API travel time {api_ms:.0f}ms)"
     log.info(f"Spawn {message.id}: {winner} (score {score:.3f}, confident={confident}, {elapsed_ms:.0f}ms){detail}")
 
     if not confident and SILENT_BELOW_THRESHOLD:
