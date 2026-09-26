@@ -84,6 +84,11 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+try:
+    import orjson  # Faster JSON parser
+except ImportError:
+    orjson = None  # Fallback to standard json if not installed
+
 try:  # optional: shrinks uploads. Without Pillow the original image is sent (same results, bigger upload)
     from PIL import Image as _PILImage
 except ImportError:
@@ -93,6 +98,7 @@ load_dotenv()
 
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+_handler.setLevel(logging.ERROR)
 
 
 class _DropVoiceWarning(logging.Filter):
@@ -175,7 +181,7 @@ BATCH_MAX = 8
 # this is the main lever for cutting total round trips without moving either deployment.
 BATCH_WAIT_MS = float(os.getenv("BATCH_WAIT_MS", "30.0"))
 # How many /v1/predict(/batch) calls this bot will have in flight at once.
-API_CONCURRENCY = 32
+API_CONCURRENCY = 8
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
 # would arrive too late to be useful, and skipping lets the queue catch up.
 MAX_SPAWN_AGE = 15.0
@@ -191,7 +197,7 @@ CACHE_FILE = "spawn_cache.pkl"
 URL_CACHE = True
 # Send the image URL to the API and let the SERVER download it (no download + upload through the bot).
 # Falls back to the download+upload path per spawn if the server can't fetch that URL.
-URL_MODE = True
+URL_MODE = os.getenv("URL_MODE", "true").lower() == "true"
 CACHE_SAVE_INTERVAL = 15.0
 # s!api dashboard: rolling window for timing stats, and how recently a channel
 # must have spawned to count as an "active incense" channel.
@@ -372,15 +378,78 @@ async def api_species_counts() -> dict:
     return await _api_request("GET", "/v1/species")
 
 
+# ---- Full Prediction Cache (1 hour TTL) ----
+_prediction_cache: Dict[str, Tuple[dict, float]] = {}  # {image_hash: (full_result, timestamp)}
+_embedding_cache: Dict[str, Tuple[List[float], float]] = {}  # {image_hash: (embedding, timestamp)}
+PREDICTION_CACHE_TTL = 3600  # 1 hour in seconds
+EMBEDDING_CACHE_TTL = 3600  # 1 hour in seconds
+
+
+def _get_image_hash(image_bytes: bytes) -> str:
+    """Generate SHA1 hash of image bytes for cache lookup."""
+    return hashlib.sha1(image_bytes).hexdigest()
+
+
+def _get_cached_prediction(image_hash: str) -> Optional[dict]:
+    """Return cached full prediction result if exists and not expired, else None."""
+    if image_hash in _prediction_cache:
+        result, timestamp = _prediction_cache[image_hash]
+        if time.time() - timestamp < PREDICTION_CACHE_TTL:
+            return result
+        else:
+            # Expired, remove it
+            del _prediction_cache[image_hash]
+    return None
+
+
+def _cache_prediction(image_hash: str, result: dict) -> None:
+    """Store complete prediction result in cache with current timestamp."""
+    _prediction_cache[image_hash] = (result, time.time())
+
+
+def _get_cached_embedding(image_hash: str) -> Optional[List[float]]:
+    """Return cached embedding if exists and not expired, else None."""
+    if image_hash in _embedding_cache:
+        embedding, timestamp = _embedding_cache[image_hash]
+        if time.time() - timestamp < EMBEDDING_CACHE_TTL:
+            return embedding
+        else:
+            # Expired, remove it
+            del _embedding_cache[image_hash]
+    return None
+
+
+def _cache_embedding(image_hash: str, embedding: List[float]) -> None:
+    """Store embedding in cache with current timestamp."""
+    _embedding_cache[image_hash] = (embedding, time.time())
+
+
 async def api_predict(image_bytes: bytes, *, threshold: Optional[float] = None,
                        include_embedding: bool = False) -> dict:
+    # Check if this EXACT image was predicted before (full result cache)
+    image_hash = _get_image_hash(image_bytes)
+    cached_result = _get_cached_prediction(image_hash)
+    if cached_result is not None:
+        # Found in cache! Return immediately (saves ~500ms API call)
+        return cached_result
+    
     form = _file_field("file", image_bytes)
     params = {}
     if threshold is not None:
         params["threshold"] = str(threshold)
     if include_embedding:
         params["include_embedding"] = "true"
-    return await _api_request("POST", "/v1/predict", data=form, params=params)
+    
+    result = await _api_request("POST", "/v1/predict", data=form, params=params)
+    
+    # Cache the FULL result for next time
+    _cache_prediction(image_hash, result)
+    
+    # Also cache the embedding if present (for hybrid usage)
+    if include_embedding and "embedding" in result and isinstance(result.get("embedding"), list):
+        _cache_embedding(image_hash, result["embedding"])
+    
+    return result
 
 
 async def api_predict_batch(images_bytes: List[bytes], *, threshold: Optional[float] = None,
@@ -476,6 +545,20 @@ async def _download(url: str) -> Optional[bytes]:
     except Exception as e:
         log.warning(f"Image download error ({type(e).__name__}): {e}")
         return None
+
+
+async def _download_parallel(urls: List[str], max_concurrent: int = 4) -> Dict[str, Optional[bytes]]:
+    """Download multiple URLs in parallel. Returns {url: bytes or None}."""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def fetch_one(url: str) -> Tuple[str, Optional[bytes]]:
+        async with semaphore:
+            result = await _download(url)
+            return url, result
+    
+    tasks = [fetch_one(url) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return {url: data for url, data in results}
 
 
 # ---- Bank-version tracking (drives cache invalidation) ---------------------
@@ -703,14 +786,31 @@ def _is_wild_spawn_embed(embed: discord.Embed) -> bool:
     return ("wild" in combined and "appeared" in combined) or ("guess the" in combined and "catch" in combined)
 
 
+def _to_media_proxy(url: str) -> str:
+    """
+    cdn.discordapp.com (raw storage) measured 150-750ms and erratic from the AI_Model
+    host; media.discordapp.net (Discord's image proxy) measured a consistent ~150ms
+    from the same host. Route every fetch through the proxy instead of raw storage.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    host = (parts.hostname or "").lower()
+    if host in ("cdn.discordapp.com", "images-ext-1.discordapp.net"):
+        parts = parts._replace(netloc="media.discordapp.net")
+        return parts.geturl()
+    return url
+
+
 def _extract_wild_spawn_image_url(message: discord.Message) -> Optional[str]:
     for embed in message.embeds:
         if not _is_wild_spawn_embed(embed):
             continue
         if embed.image and embed.image.url:
-            return embed.image.url
+            return _to_media_proxy(embed.image.url)
         if embed.thumbnail and embed.thumbnail.url:
-            return embed.thumbnail.url
+            return _to_media_proxy(embed.thumbnail.url)
     return None
 
 
@@ -911,18 +1011,31 @@ async def _identify_spawn(url: str, received: float, timing: Optional[dict] = No
     cache_url = url if URL_CACHE else None
 
     async def work(url_entry):
+        # Prefetch the download in parallel with the API call to reduce latency.
+        # If API succeeds, drop the download. If API fails, use pre-fetched bytes.
+        download_task = asyncio.create_task(_download(url))
+        
         if URL_MODE and _url_host(url) not in _url_blocked_hosts:
-            got = await _identify_via_server_fetch(url, timing)
-            if got is not None:
-                res, digest = got
-                _stats["misses"] += 1
-                if digest:
-                    await _cache_put(digest, res, cache_url)
-                return res
+            try:
+                got = await _identify_via_server_fetch(url, timing)
+                if got is not None:
+                    download_task.cancel()  # Cancel parallel download, not needed.
+                    res, digest = got
+                    _stats["misses"] += 1
+                    if digest:
+                        await _cache_put(digest, res, cache_url)
+                    return res
+            except Exception:
+                pass  # Fall through to download+upload path
             if timing is not None:
                 timing.pop("api", None)
+        
+        # Fallback: retrieve the pre-fetched download.
         t_dl = time.perf_counter()
-        image_bytes = await _download(url)
+        try:
+            image_bytes = await asyncio.wait_for(download_task, timeout=15.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            image_bytes = None
         if timing is not None:
             timing["dl"] = (time.perf_counter() - t_dl) * 1000
         if not image_bytes:
@@ -1180,7 +1293,18 @@ async def on_message(message: discord.Message):
     confident = score >= CONFIDENCE_THRESHOLD
     api_ms = timing.get("api", 0.0)
     bot_ms = max(elapsed_ms - api_ms, 0.0)
-    detail = f" (bot analysis {bot_ms:.0f}ms, API travel time {api_ms:.0f}ms)"
+    breakdown = []
+    if "fetch" in timing:
+        breakdown.append(f"CDN fetch {timing['fetch']:.0f}ms")
+    if "srv" in timing:
+        breakdown.append(f"embed+match {timing['srv']:.0f}ms")
+    if "dl" in timing:
+        breakdown.append(f"bot download {timing['dl']:.0f}ms")
+    host = _url_host(image_url)
+    detail = (
+        f" (bot analysis {bot_ms:.0f}ms, API travel time {api_ms:.0f}ms"
+        f"{', ' + ', '.join(breakdown) if breakdown else ''}, host={host})"
+    )
     log.info(f"Spawn {message.id}: {winner} (score {score:.3f}, confident={confident}, {elapsed_ms:.0f}ms){detail}")
 
     if not confident and SILENT_BELOW_THRESHOLD:
