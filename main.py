@@ -53,6 +53,21 @@ Commands (owner-only, prefix configurable via COMMAND_PREFIX, default "s!"):
                            s!backfill stop  - pause a running backfill (progress
                                               is checkpointed; re-run the same
                                               command to resume).
+    s!bulklearn [dry] [known-only]
+                         - attach a .zip/.rar/.7z (or reply to a message that
+                           has one), laid out one folder per species just like
+                           AI_Model's "Extra pokemons/" convention:
+                               my_pokemons.zip
+                                 pikachu/img1.jpg
+                                 charizard/img1.jpg ...
+                           Extracts it, then teaches every image via
+                           /v1/learn/batch - purely additive (appends to
+                           bank/learned.jsonl on the server, never touches
+                           base_features.npy/base_species.npy, no retrain
+                           needed). "dry" previews species/counts without
+                           teaching anything. "known-only" skips folders whose
+                           name doesn't already match a known species instead
+                           of auto-creating them (protects against typos).
 
 Optional auto-learning (AUTO_LEARN=true): learns from the last spawn in a
 channel if the bot guessed it wrong or wasn't confident. Where the "correct"
@@ -72,9 +87,13 @@ import sys
 import json
 import time
 import pickle
+import shutil
+import tempfile
+import zipfile
 import hashlib
 import asyncio
 import logging
+from pathlib import Path
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -261,6 +280,17 @@ BACKFILL_CHECKPOINT_PATH = os.getenv("BACKFILL_CHECKPOINT_PATH", "backfill_check
 BACKFILL_CHECKPOINT_INTERVAL = float(os.getenv("BACKFILL_CHECKPOINT_INTERVAL", "10"))
 _backfill_checkpoint_lock = asyncio.Lock()
 
+# -- s!bulklearn --
+# Teach the bot from an uploaded archive of images (one folder per species)
+# instead of scanning Discord history. Same /v1/learn/batch endpoint as
+# s!backfill, just sourced from a zip/rar/7z instead of channel messages.
+BULKLEARN_BATCH_SIZE = 32                # pairs per /v1/learn/batch call
+BULKLEARN_WORKERS = 4                    # concurrent batch calls in flight
+BULKLEARN_MAX_ARCHIVE_MB = int(os.getenv("BULKLEARN_MAX_ARCHIVE_MB", "500"))
+_BULKLEARN_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+_BULKLEARN_ARCHIVE_EXT = (".zip", ".rar", ".7z")
+_bulklearn_active = False
+
 if AUTO_LEARN and AUTO_LEARN_SOURCE == "bot" and not AUTO_LEARN_SOURCE_BOT_ID:
     raise RuntimeError(
         "AUTO_LEARN_SOURCE=bot requires AUTO_LEARN_SOURCE_BOT_ID to be set in your .env "
@@ -312,6 +342,79 @@ def _shrink_for_upload(data: bytes) -> bytes:
         return small if len(small) < len(data) else data
     except Exception:
         return data
+
+
+# ---- s!bulklearn: archive -> (species, image_bytes) pairs -----------------
+def _normalize_species_folder(name: str) -> str:
+    """Same convention AI_Model's train_model.py uses for 'Extra pokemons/<species>/'
+    folders, so anything taught here lines up with species names used in training."""
+    return name.replace("_", " ").strip().lower()
+
+
+def _extract_archive_to(archive_path: Path, dest_dir: Path) -> None:
+    """Extract .zip / .rar / .7z into dest_dir. Mirrors AI_Model/train_model.py's
+    extractor so the same archive formats work on both the trainer and the bot."""
+    ext = archive_path.suffix.lower()
+    if ext == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(dest_dir)
+    elif ext == ".rar":
+        try:
+            import rarfile
+            with rarfile.RarFile(archive_path) as rf:
+                rf.extractall(dest_dir)
+        except Exception:
+            import subprocess
+            subprocess.run(["unrar", "x", "-y", str(archive_path), str(dest_dir)],
+                            capture_output=True, check=False)
+    elif ext == ".7z":
+        try:
+            import py7zr
+            with py7zr.SevenZipFile(archive_path, "r") as sz:
+                sz.extractall(dest_dir)
+        except Exception:
+            import subprocess
+            subprocess.run(["7z", "x", "-y", str(archive_path), f"-o{dest_dir}"],
+                            capture_output=True, check=False)
+    else:
+        raise ValueError(f"Unsupported archive type: {ext}")
+
+
+def _find_species_root(extracted_dir: Path) -> Path:
+    """
+    Zipping a folder often wraps everything in one parent directory, e.g.
+    zipping 'Extra pokemons/' produces 'Extra pokemons/pikachu/...' once
+    extracted. If extracted_dir has exactly one subdirectory and no loose
+    files, descend into it so species folders are found either way.
+    """
+    entries = [p for p in extracted_dir.iterdir() if not p.name.startswith("__MACOSX")]
+    dirs = [p for p in entries if p.is_dir()]
+    files = [p for p in entries if p.is_file()]
+    if len(dirs) == 1 and not files:
+        return dirs[0]
+    return extracted_dir
+
+
+def _iter_species_images(root: Path):
+    """Yield (species, image_path) for every image directly inside a species subfolder of root."""
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir():
+            continue
+        species = _normalize_species_folder(folder.name)
+        if not species:
+            continue
+        for img_path in sorted(folder.iterdir()):
+            if img_path.is_file() and img_path.suffix.lower() in _BULKLEARN_IMAGE_EXT:
+                yield species, img_path
+
+
+def _bulklearn_status_line(done: int, total: int, stats: dict) -> str:
+    pct = (done / total * 100) if total else 100
+    return (
+        f"Teaching... {done}/{total} ({pct:.0f}%) - "
+        f"learned {stats['learned']:,}, dup {stats['duplicate']:,}, "
+        f"unknown {stats['unknown']:,}, errors {stats['errors']:,}"
+    )
 
 
 # ---- HTTP session + AI_Model API client ------------------------------------
@@ -1791,6 +1894,212 @@ async def backfill_cmd(ctx: commands.Context, scope: str = "channel", limit: Opt
         for t in worker_tasks:
             t.cancel()
         _backfill_active = False
+
+
+@bot.command(name="bulklearn", aliases=["learnfolder", "learnarchive"])
+@commands.is_owner()
+async def bulklearn_cmd(ctx: commands.Context, *flags: str):
+    """
+    Bulk-teach the bot from an uploaded archive, one folder per species:
+
+        my_pokemons.zip
+          pikachu/
+            img1.jpg
+            img2.png
+          charizard/
+            img1.jpg
+
+    Attach the .zip/.rar/.7z to your message (or reply to a message that has
+    one) and run:
+        s!bulklearn              - teach everything, auto-creating new species
+        s!bulklearn dry          - preview species/counts, teaches nothing
+        s!bulklearn known-only   - skip folders that don't match an existing
+                                    species instead of auto-creating them
+
+    Uses the same POST /v1/learn/batch endpoint as s!learn and s!backfill, so
+    this is purely additive: it appends to bank/learned.jsonl on the AI_Model
+    server. It never touches base_features.npy / base_species.npy and never
+    needs a retrain - the API picks it up immediately.
+    """
+    global _bulklearn_active
+
+    if _bulklearn_active:
+        await ctx.send("A bulklearn run is already in progress - wait for it to finish.")
+        return
+
+    flag_words = {f.strip().lower() for f in flags}
+    dry_run = bool(flag_words & {"dry", "dryrun", "dry-run", "preview"})
+    allow_new = not bool(flag_words & {"known-only", "known", "no-new", "strict"})
+
+    # ---- find the archive attachment (this message, or the one replied to) ----
+    attachment = None
+    for att in ctx.message.attachments:
+        if att.filename.lower().endswith(_BULKLEARN_ARCHIVE_EXT):
+            attachment = att
+            break
+    if attachment is None and ctx.message.reference is not None:
+        replied = ctx.message.reference.resolved
+        if not isinstance(replied, discord.Message):
+            try:
+                replied = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            except discord.HTTPException:
+                replied = None
+        if replied is not None:
+            for att in replied.attachments:
+                if att.filename.lower().endswith(_BULKLEARN_ARCHIVE_EXT):
+                    attachment = att
+                    break
+
+    if attachment is None:
+        await ctx.send(
+            "Attach a `.zip`, `.rar`, or `.7z` file (or reply to a message that has one) "
+            f"when using `{COMMAND_PREFIX}bulklearn`. It should contain one folder per "
+            "species, e.g. `pikachu/img1.jpg`."
+        )
+        return
+
+    size_mb = attachment.size / (1024 * 1024)
+    if size_mb > BULKLEARN_MAX_ARCHIVE_MB:
+        await ctx.send(
+            f"That archive is {size_mb:.0f} MB - larger than the {BULKLEARN_MAX_ARCHIVE_MB} MB "
+            "safety cap for this command. Split it into smaller archives, or raise "
+            "BULKLEARN_MAX_ARCHIVE_MB in your .env if this bot's host has room for it."
+        )
+        return
+
+    _bulklearn_active = True
+    status_msg = await ctx.send(f"Downloading `{attachment.filename}` ({size_mb:.1f} MB)...")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="bulklearn_"))
+
+    try:
+        archive_path = tmp_dir / attachment.filename
+        try:
+            await attachment.save(archive_path)
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"Couldn't download the attachment: {e}")
+            return
+
+        await status_msg.edit(content=f"Extracting `{attachment.filename}`...")
+        extract_dir = tmp_dir / "extracted"
+        extract_dir.mkdir(exist_ok=True)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _extract_archive_to, archive_path, extract_dir
+            )
+        except Exception as e:
+            await status_msg.edit(content=f"Couldn't extract that archive: {type(e).__name__}: {e}")
+            return
+
+        species_root = _find_species_root(extract_dir)
+        pairs = list(_iter_species_images(species_root))
+        if not pairs:
+            await status_msg.edit(
+                content="No images found. Make sure the archive has one folder per "
+                        "species with images directly inside (e.g. `pikachu/img1.jpg`)."
+            )
+            return
+
+        by_species: Dict[str, int] = {}
+        for sp, _ in pairs:
+            by_species[sp] = by_species.get(sp, 0) + 1
+
+        if dry_run:
+            lines = [f"**Dry run** - found {len(pairs)} image(s) across {len(by_species)} species:"]
+            for sp, n in sorted(by_species.items(), key=lambda kv: -kv[1])[:25]:
+                lines.append(f"  {sp:<20s} {n}")
+            if len(by_species) > 25:
+                lines.append(f"  ...and {len(by_species) - 25} more species")
+            lines.append(f"\nRun `{COMMAND_PREFIX}bulklearn` (no `dry`) to actually teach these.")
+            await status_msg.edit(content="\n".join(lines))
+            return
+
+        stats = {"learned": 0, "duplicate": 0, "unknown": 0, "errors": 0}
+        unknown_species: set = set()
+        total = len(pairs)
+        done = 0
+        last_edit = 0.0
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=BULKLEARN_BATCH_SIZE * BULKLEARN_WORKERS * 2)
+
+        async def _producer():
+            for sp, path in pairs:
+                try:
+                    raw = await asyncio.get_running_loop().run_in_executor(None, path.read_bytes)
+                except Exception:
+                    stats["errors"] += 1
+                    continue
+                try:
+                    small = await asyncio.get_running_loop().run_in_executor(None, _shrink_for_upload, raw)
+                except Exception:
+                    small = raw
+                await queue.put((sp, small))
+            for _ in range(BULKLEARN_WORKERS):
+                await queue.put(None)
+
+        async def _worker():
+            nonlocal done, last_edit
+            while True:
+                first = await queue.get()
+                if first is None:
+                    return
+                batch = [first]
+                while len(batch) < BULKLEARN_BATCH_SIZE:
+                    try:
+                        item = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if item is None:
+                        await queue.put(None)  # let sibling workers see the sentinel too
+                        break
+                    batch.append(item)
+
+                try:
+                    results = await api_learn_batch(batch, allow_new=allow_new)
+                except Exception as e:
+                    stats["errors"] += len(batch)
+                    log.warning(f"bulklearn: /v1/learn/batch failed: {type(e).__name__}: {e}")
+                    results = []
+
+                for (sp, _), r in zip(batch, results):
+                    status = r.get("status", "error")
+                    if status in stats:
+                        stats[status] += 1
+                    else:
+                        stats["errors"] += 1
+                    if status == "unknown":
+                        unknown_species.add(sp)
+                done += len(batch)
+
+                now = time.time()
+                if now - last_edit > 3:
+                    last_edit = now
+                    try:
+                        await status_msg.edit(content=_bulklearn_status_line(done, total, stats))
+                    except discord.HTTPException:
+                        pass
+
+        producer_task = asyncio.create_task(_producer())
+        worker_tasks = [asyncio.create_task(_worker()) for _ in range(BULKLEARN_WORKERS)]
+        await producer_task
+        await asyncio.gather(*worker_tasks)
+
+        summary = (
+            f"**Bulklearn complete** - {total} image(s) across {len(by_species)} species.\n"
+            f"Learned: {stats['learned']:,} | Already had: {stats['duplicate']:,} | "
+            f"Unknown species: {stats['unknown']:,} | Errors: {stats['errors']:,}"
+        )
+        if unknown_species and not allow_new:
+            sample = ", ".join(sorted(unknown_species)[:15])
+            summary += (
+                f"\nSkipped unknown species (folder name didn't match any existing species): "
+                f"{sample}{'...' if len(unknown_species) > 15 else ''}\n"
+                f"Re-run without `known-only` to auto-create them, or fix the folder names."
+            )
+        await status_msg.edit(content=summary)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _bulklearn_active = False
 
 
 @bot.command(name="naming")
