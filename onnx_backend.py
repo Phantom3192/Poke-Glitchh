@@ -59,17 +59,23 @@ def onnx_matches_source(onnx_path: str, source_path: str) -> Optional[bool]:
 
 
 class OnnxExtractor:
-    def __init__(self, onnx_path: str, threads: int = 1):
+    def __init__(self, onnx_path: str, threads: int = 1, inter_threads: int = 1):
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, int(threads))
-        so.inter_op_num_threads = 1
-        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.inter_op_num_threads = max(1, int(inter_threads))
+        # ORT_PARALLEL lets independent graph branches run on separate inter-op
+        # threads; with inter_threads == 1 this degrades to sequential anyway,
+        # so only flip it on when there's actually a second thread to use.
+        so.execution_mode = (
+            ort.ExecutionMode.ORT_PARALLEL if inter_threads > 1 else ort.ExecutionMode.ORT_SEQUENTIAL
+        )
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if threads > 1:
+        if threads > 1 or inter_threads > 1:
             # don't burn CPU spinning between requests inside a shared container
             so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            so.add_session_config_entry("session.inter_op.allow_spinning", "0")
         self.session = ort.InferenceSession(onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         out_dim = self.session.get_outputs()[0].shape[-1]
