@@ -95,13 +95,23 @@ import asyncio
 import logging
 from pathlib import Path
 from collections import OrderedDict, deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+import pokedata
+from guild_store import store as guild_store
+
+try:
+    import psutil  # optional: CPU/RAM numbers for s!ping. Bot works fine without it.
+except ImportError:
+    psutil = None
+
+_BOT_START_TIME = time.time()
 
 try:
     import orjson  # Faster JSON parser
@@ -255,6 +265,17 @@ AUTO_LEARN_SOURCE_REGEX = os.getenv(
 AUTO_LEARN_SOURCE_MIN_CONFIDENCE = float(os.getenv("AUTO_LEARN_SOURCE_MIN_CONFIDENCE", "0.9"))
 _AUTO_LEARN_SOURCE_RE = re.compile(AUTO_LEARN_SOURCE_REGEX, re.IGNORECASE) if AUTO_LEARN_SOURCE == "bot" else None
 
+# -- Spawn reply decoration (type emojis / best name / copyable catch command) --
+# What a catch command looks like when we hand it to you copy-pasteable, e.g.
+# "c {name}" (Poketwo's real shorthand) or "@Poketwo#8236 c {name}" if you'd
+# rather it look like the old bot's output. {name} is filled with the "best name".
+CATCH_COMMAND_TEMPLATE = os.getenv("CATCH_COMMAND_TEMPLATE", "c {name}")
+# Regex used to guess whether a spawn is shiny, for s!sh pings. Poketwo/clones
+# usually put a sparkle or the word "shiny" somewhere in the spawn embed when
+# it's shiny - adjust SHINY_REGEX in .env if your spawn bot phrases it differently.
+SHINY_REGEX = os.getenv("SHINY_REGEX", r"[\u2728\u2b50]|shiny")
+_SHINY_RE = re.compile(SHINY_REGEX, re.IGNORECASE)
+
 # -- s!backfill --
 # Poketwo (and most clones) name the PREVIOUS spawn when the NEXT one appears:
 # "Wild Glalie fled. A new wild pokemon has appeared!" - so every spawn image
@@ -302,7 +323,7 @@ if AUTO_LEARN and AUTO_LEARN_SOURCE not in ("catch", "bot"):
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
 # -- per-guild naming on/off --
 DISABLED_GUILDS_FILE = os.getenv("DISABLED_GUILDS_FILE", "disabled_guilds.json")
@@ -1414,13 +1435,51 @@ async def on_message(message: discord.Message):
         return
 
     display_name = _display(winner)
-    if confident:
-        reply_text = f"{display_name} - {display_confidence(winner, score, neighbors) * 100:.1f}%"
-    else:
-        reply_text = f"{display_name}? - {display_confidence(winner, score, neighbors) * 100:.1f}% (low confidence, might be wrong)"
+    conf_pct = display_confidence(winner, score, neighbors) * 100
 
+    # Awaited (with a short timeout) so THIS species' own data is what gets used -
+    # never a leftover value from whatever species was looked up before it. Capped
+    # at 2s so a slow/unreachable PokeAPI can't stall the spawn reply; if it times
+    # out we just fall back to no emoji/plain name for this one reply, and the
+    # fetch keeps running in the background so the next sighting has it cached.
+    pdata = await pokedata.get_species_data(winner, display_name)
+    type_emojis = pokedata.emojis_for(pdata)
+    best_name = pdata.get("best_name") or display_name
+    embed_color = pokedata.color_for(pdata, fallback=0x57F287 if confident else 0xFEE75C)
+
+    bar_len = 10
+    filled = round((conf_pct / 100) * bar_len) if confident or conf_pct > 0 else 0
+    conf_bar = "▰" * filled + "▱" * (bar_len - filled)
+
+    emoji_prefix = "".join(type_emojis) + " " if type_emojis else ""
+    embed = discord.Embed(color=embed_color)
+    embed.set_author(name=f"{emoji_prefix}{display_name}{'' if confident else ' (unsure)'}")
+    embed.description = f"`{conf_bar}` **{conf_pct:.2f}%**"
+    if best_name.lower() != display_name.lower():
+        embed.description += f"\n**Fastest catch:** `{best_name}`"
+    catch_cmd = CATCH_COMMAND_TEMPLATE.format(name=best_name)
+    embed.add_field(name="⚡ Command", value=f"```{catch_cmd}```", inline=False)
+    embed.set_thumbnail(url=image_url)
+    if not confident:
+        embed.set_footer(text="Low confidence - might be wrong")
+
+    # Who gets pinged: a reserve on this species always wins over a plain collection
+    # entry (reserve = "this one's claimed"), plus anyone currently shiny hunting it
+    # if this spawn looks shiny.
+    ping_ids: Set[int] = set()
+    guild_id = message.guild.id if message.guild else None
+    if guild_id is not None:
+        reserved_to = guild_store.reserve_matches(guild_id, winner)
+        ping_ids |= reserved_to if reserved_to else guild_store.collection_matches(guild_id, winner)
+        if _SHINY_RE.search(_message_text(message)):
+            ping_ids |= guild_store.shiny_matches(guild_id, winner)
+
+    content = " ".join(f"<@{uid}>" for uid in ping_ids) or None
     try:
-        await message.reply(reply_text, allowed_mentions=discord.AllowedMentions.none())
+        await message.reply(
+            content=content, embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+        )
     except discord.HTTPException as e:
         log.warning(f"Failed to reply to spawn message {message.id}: {e}")
         return
@@ -2406,6 +2465,244 @@ async def threshold_cmd(ctx: commands.Context, value: Optional[float] = None):
         return
     CONFIDENCE_THRESHOLD = value
     await ctx.send(f"Confidence threshold set to `{CONFIDENCE_THRESHOLD}` (sent to the API on every prediction).")
+
+
+def _parse_species_list(raw: str) -> List[str]:
+    """'rayquaza, vanillite  charizard' -> ['rayquaza', 'vanillite', 'charizard']"""
+    parts = re.split(r"[,\n]+", raw)
+    out: List[str] = []
+    for p in parts:
+        out.extend(p.split())
+    return [p.strip() for p in out if p.strip()]
+
+
+async def _has_res_role(ctx: commands.Context) -> bool:
+    if ctx.guild is None:
+        return False
+    if ctx.author.guild_permissions.manage_guild or await bot.is_owner(ctx.author):
+        return True
+    role_id = guild_store.get_res_role(ctx.guild.id)
+    if role_id is None:
+        return False
+    return any(r.id == role_id for r in getattr(ctx.author, "roles", []))
+
+
+@bot.command(name="ping")
+async def ping_cmd(ctx: commands.Context):
+    """Bot performance: websocket latency, API latency, CPU/RAM, uptime."""
+    ws_ms = bot.latency * 1000
+    d = await _api_snapshot()
+    _, _, r_avg, r_last = d["response"]
+    uptime = int(time.time() - _BOT_START_TIME)
+    days, rem = divmod(uptime, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    embed = discord.Embed(title="🏓 Pong!", color=discord.Color.blurple())
+    embed.add_field(name="WebSocket Latency", value=f"`{ws_ms:.2f} ms`")
+    embed.add_field(name="API Latency", value=f"`{_fmt_ms(r_last)}`" if r_last else "`-`")
+    if psutil:
+        proc = psutil.Process()
+        embed.add_field(name="CPU Usage", value=f"`{proc.cpu_percent(interval=0.1):.1f}%`")
+        mem = proc.memory_info().rss / (1024 * 1024)
+        total = psutil.virtual_memory().total / (1024 * 1024)
+        embed.add_field(name="RAM Usage", value=f"`{mem:,.0f} MB / {total:,.0f} MB`")
+    embed.add_field(name="System Uptime", value=f"`{days}d, {hours:02}:{minutes:02}:{seconds:02}`")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="model")
+async def model_cmd(ctx: commands.Context):
+    """Which model/backend the AI_Model API is running, plus recent latency."""
+    try:
+        health = await api_health()
+        stats = await api_stats()
+    except Exception as e:
+        await ctx.send(f"Couldn't reach the AI_Model API: {type(e).__name__}: {e}")
+        return
+    d = await _api_snapshot()
+    _, _, i_avg, i_last = d["inference"]
+    embed = discord.Embed(title="Model Info", color=discord.Color.blurple())
+    embed.add_field(name="Backend", value=f"`{health.get('backend') or stats.get('backend', '?')}`")
+    embed.add_field(name="Model", value=f"`{stats.get('model', '?')}`")
+    embed.add_field(name="Species Loaded", value=f"`{health.get('species', stats.get('species', '?'))}`")
+    embed.add_field(name="Feature Vectors", value=f"`{health.get('vectors', stats.get('vectors', '?')):,}`"
+                     if isinstance(health.get('vectors', stats.get('vectors')), int) else "`?`")
+    embed.add_field(name="Embed Latency (latest)", value=f"`{_fmt_ms(i_last)}`")
+    embed.add_field(name="Embed Latency (avg)", value=f"`{_fmt_ms(i_avg)}`")
+    embed.set_footer(text=f"API: {AI_MODEL_API_URL}")
+    await ctx.send(embed=embed)
+
+
+@bot.group(name="cl", invoke_without_command=True)
+async def cl_cmd(ctx: commands.Context, action: Optional[str] = None, *, species: str = ""):
+    """
+    s!cl add <pokemon> [pokemon2 ...]   - get pinged in this server when it spawns
+    s!cl remove <pokemon> [pokemon2 ...]
+    s!cl list
+    """
+    if ctx.guild is None:
+        await ctx.send("This only works in a server.")
+        return
+    action = (action or "").lower()
+    names = _parse_species_list(species)
+    if action == "add" and names:
+        added = guild_store.collection_add(ctx.guild.id, ctx.author.id, names)
+        await ctx.send(f"**Added:** {', '.join(_display(n) for n in added)}" if added
+                        else "Already in your collection.")
+    elif action == "remove" and names:
+        removed = guild_store.collection_remove(ctx.guild.id, ctx.author.id, names)
+        await ctx.send(f"**Removed:** {', '.join(_display(n) for n in removed)}" if removed
+                        else "None of those were in your collection.")
+    elif action in ("list", "", None):
+        mine = guild_store.collection_list(ctx.guild.id, ctx.author.id)
+        await ctx.send("Your collection is empty." if not mine else
+                        "**Your collection:** " + ", ".join(_display(n) for n in mine))
+    else:
+        await ctx.send(f"Usage: `{COMMAND_PREFIX}cl add <pokemon>`, `{COMMAND_PREFIX}cl remove <pokemon>`, "
+                        f"or `{COMMAND_PREFIX}cl list`.")
+
+
+@bot.group(name="res", invoke_without_command=True)
+async def res_cmd(ctx: commands.Context, action: Optional[str] = None, *, rest: str = ""):
+    """
+    s!res add <pokemon> [pokemon2 ...] @user   - reserve species to @user (silences their collection ping)
+    s!res remove <pokemon> [pokemon2 ...] @user
+    s!res list [@user]
+    s!res role @role                            - (Manage Server) set who's allowed to use res add/remove
+    """
+    if ctx.guild is None:
+        await ctx.send("This only works in a server.")
+        return
+    action = (action or "").lower()
+
+    if action == "role":
+        if not ctx.author.guild_permissions.manage_guild:
+            await ctx.send("Only someone with **Manage Server** can set the res role.")
+            return
+        if ctx.message.role_mentions:
+            role = ctx.message.role_mentions[0]
+            guild_store.set_res_role(ctx.guild.id, role.id)
+            await ctx.send(f"**{role.name}** can now use `{COMMAND_PREFIX}res add`/`remove`.")
+        else:
+            guild_store.set_res_role(ctx.guild.id, None)
+            await ctx.send("Res role cleared - only Manage Server members can use res add/remove now.")
+        return
+
+    if action in ("add", "remove"):
+        if not await _has_res_role(ctx):
+            await ctx.send("You don't have the role allowed to use `res` in this server.")
+            return
+        target = ctx.message.mentions[0] if ctx.message.mentions else None
+        if target is None:
+            await ctx.send(f"Mention who this reservation is for, e.g. "
+                            f"`{COMMAND_PREFIX}res add rayquaza @user`.")
+            return
+        text_without_mention = re.sub(r"<@!?\d+>", "", rest).strip()
+        names = _parse_species_list(text_without_mention)
+        if not names:
+            await ctx.send("Give at least one Pokemon to reserve.")
+            return
+        if action == "add":
+            added = guild_store.reserve_add(ctx.guild.id, target.id, names)
+            await ctx.send(f"**Added reserves for** {', '.join(_display(n) for n in added)} "
+                            f"**to** {target.mention}." if added else "Already reserved.")
+        else:
+            removed = guild_store.reserve_remove(ctx.guild.id, target.id, names)
+            await ctx.send(f"**Removed reserves for** {', '.join(_display(n) for n in removed)} "
+                            f"**from** {target.mention}." if removed else "None of those were reserved.")
+        return
+
+    if action in ("list", "", None):
+        target = ctx.message.mentions[0] if ctx.message.mentions else ctx.author
+        mine = guild_store.reserve_list(ctx.guild.id, target.id)
+        await ctx.send(f"{target.mention} has no reserves." if not mine else
+                        f"**{target.display_name}'s reserves:** " + ", ".join(_display(n) for n in mine))
+        return
+
+    await ctx.send(f"Usage: `{COMMAND_PREFIX}res add <pokemon> @user`, `{COMMAND_PREFIX}res remove <pokemon> @user`, "
+                    f"`{COMMAND_PREFIX}res list [@user]`, or `{COMMAND_PREFIX}res role @role`.")
+
+
+@bot.command(name="sh")
+async def shiny_hunt_cmd(ctx: commands.Context, *, species: Optional[str] = None):
+    """
+    s!sh <pokemon>  - shiny hunt one Pokemon at a time in this server (replaces any previous target)
+    s!sh clear      - stop shiny hunting
+    s!sh            - show your current target
+    """
+    if ctx.guild is None:
+        await ctx.send("This only works in a server.")
+        return
+    if species is None:
+        current = guild_store.shiny_get(ctx.guild.id, ctx.author.id)
+        await ctx.send(f"You're shiny hunting **{_display(current)}**." if current
+                        else "You're not shiny hunting anything right now.")
+        return
+    if species.strip().lower() == "clear":
+        guild_store.shiny_set(ctx.guild.id, ctx.author.id, None)
+        await ctx.send("Shiny hunt cleared.")
+        return
+    name = species.strip()
+    guild_store.shiny_set(ctx.guild.id, ctx.author.id, name)
+    await ctx.send(f"You are now shiny hunting **{_display(name)}**.")
+
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(
+        title="Poke-Glitch Commands",
+        description=f"Prefix: `{COMMAND_PREFIX}`",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Everyone", value=(
+        f"`{COMMAND_PREFIX}cl add/remove/list <pokemon>` - ping me when it spawns\n"
+        f"`{COMMAND_PREFIX}sh <pokemon>` / `clear` - shiny hunt one Pokemon\n"
+        f"`{COMMAND_PREFIX}res list [@user]` - view reserves\n"
+        f"`{COMMAND_PREFIX}ping` - bot latency/health\n"
+        f"`{COMMAND_PREFIX}model` - which AI model is running\n"
+        f"`{COMMAND_PREFIX}naming` - is spawn-naming on in this server?"
+    ), inline=False)
+    embed.add_field(name="Allowed res role / Manage Server", value=(
+        f"`{COMMAND_PREFIX}res add <pokemon> @user` - reserve a species to someone "
+        f"(silences their collection ping for it)\n"
+        f"`{COMMAND_PREFIX}res remove <pokemon> @user`\n"
+        f"`{COMMAND_PREFIX}res role @role` - set who's allowed to use res add/remove"
+    ), inline=False)
+    embed.add_field(name="Bot owner", value=(
+        f"`{COMMAND_PREFIX}predict`, `{COMMAND_PREFIX}learn`, `{COMMAND_PREFIX}forget`, `{COMMAND_PREFIX}undo`, "
+        f"`{COMMAND_PREFIX}checklist`, `{COMMAND_PREFIX}stats`, `{COMMAND_PREFIX}api`, `{COMMAND_PREFIX}reload`, "
+        f"`{COMMAND_PREFIX}threshold`, `{COMMAND_PREFIX}naming on/off`, `{COMMAND_PREFIX}backfill`, "
+        f"`{COMMAND_PREFIX}bulklearn`"
+    ), inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="bestname")
+@commands.is_owner()
+async def bestname_cmd(ctx: commands.Context, *, species: str):
+    """Debug: show exactly what pokedata resolves for one species (bypasses the spawn path)."""
+    display_name = _display(species.strip().lower().replace(" ", "_"))
+    pdata = await pokedata.get_species_data(species, display_name, timeout=5.0)
+    await ctx.send(
+        f"species=`{species}` slug=`{pokedata._slugify(species)}` -> "
+        f"types=`{pdata.get('types')}` best_name=`{pdata.get('best_name')}`"
+    )
+
+
+@bot.command(name="pokedataclear")
+@commands.is_owner()
+async def pokedata_clear_cmd(ctx: commands.Context, *, species: Optional[str] = None):
+    """Debug: drop one species (or the whole cache) from pokedata_cache.json and re-fetch it clean."""
+    if species:
+        key = species.strip().lower()
+        pokedata._cache.pop(key, None)
+        pokedata._save_cache()
+        await ctx.send(f"Cleared cached pokedata for `{species}`. It'll be re-fetched next time it's needed.")
+    else:
+        pokedata._cache.clear()
+        pokedata._save_cache()
+        await ctx.send("Cleared the entire pokedata cache.")
 
 
 def _on_sigterm(signum, frame):
