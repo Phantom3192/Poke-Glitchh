@@ -1444,24 +1444,33 @@ async def on_message(message: discord.Message):
     # fetch keeps running in the background so the next sighting has it cached.
     pdata = await pokedata.get_species_data(winner, display_name)
     type_emojis = pokedata.emojis_for(pdata)
-    best_name = pdata.get("best_name") or display_name
     embed_color = pokedata.color_for(pdata, fallback=0x57F287 if confident else 0xFEE75C)
 
     bar_len = 10
     filled = round((conf_pct / 100) * bar_len) if confident or conf_pct > 0 else 0
     conf_bar = "▰" * filled + "▱" * (bar_len - filled)
 
+    # NOTE: custom emoji only render in an embed's description/field values -
+    # Discord's client shows them as literal "<:Name:id>" text anywhere else
+    # (author name, title, footer), so the type emoji goes in the description,
+    # not in set_author.
     emoji_prefix = "".join(type_emojis) + " " if type_emojis else ""
     embed = discord.Embed(color=embed_color)
-    embed.set_author(name=f"{emoji_prefix}{display_name}{'' if confident else ' (unsure)'}")
-    embed.description = f"`{conf_bar}` **{conf_pct:.2f}%**"
-    if best_name.lower() != display_name.lower():
-        embed.description += f"\n**Fastest catch:** `{best_name}`"
-    catch_cmd = CATCH_COMMAND_TEMPLATE.format(name=best_name)
-    embed.add_field(name="⚡ Command", value=f"```{catch_cmd}```", inline=False)
+    embed.description = (
+        f"## {emoji_prefix}{display_name}{'' if confident else ' (unsure)'}\n"
+        f"{conf_bar} **{conf_pct:.2f}%**"
+    )
+    # Always use the species' own main name for the catch command - not the
+    # shorter alt-language "best_name" pokedata can find, since that can be a
+    # completely different-looking string (e.g. a Japanese romanization) that
+    # doesn't match what's actually on screen.
+    catch_cmd = CATCH_COMMAND_TEMPLATE.format(name=display_name)
+    embed.add_field(name="Command", value=f"```{catch_cmd}```", inline=False)
     embed.set_thumbnail(url=image_url)
+    footer = f"{elapsed_ms:.0f}ms"
     if not confident:
-        embed.set_footer(text="Low confidence - might be wrong")
+        footer += " · low confidence, might be wrong"
+    embed.set_footer(text=footer)
 
     # Who gets pinged: a reserve on this species always wins over a plain collection
     # entry (reserve = "this one's claimed"), plus anyone currently shiny hunting it
@@ -1474,7 +1483,9 @@ async def on_message(message: discord.Message):
         if _SHINY_RE.search(_message_text(message)):
             ping_ids |= guild_store.shiny_matches(guild_id, winner)
 
-    content = " ".join(f"<@{uid}>" for uid in ping_ids) or None
+    ping_text = " ".join(f"<@{uid}>" for uid in ping_ids)
+    copy_line = f"**Click to Copy ->** `{catch_cmd}`"
+    content = f"{ping_text}\n{copy_line}" if ping_text else copy_line
     try:
         await message.reply(
             content=content, embed=embed,
