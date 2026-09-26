@@ -7,3 +7,6 @@ orjson>=3.9.0
 
 rarfile>=4.0
 py7zr>=0.20.0
+
+# Optional: powers s!ping's CPU/RAM fields. s!ping still works without it.
+psutil>=5.9.0
