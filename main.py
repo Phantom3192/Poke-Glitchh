@@ -96,7 +96,7 @@ import logging
 from pathlib import Path
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qsl, urlencode
 
 import aiohttp
 import discord
@@ -211,6 +211,11 @@ BATCH_MAX = 8
 BATCH_WAIT_MS = float(os.getenv("BATCH_WAIT_MS", "30.0"))
 # How many /v1/predict(/batch) calls this bot will have in flight at once.
 API_CONCURRENCY = 8
+# The model's input resolution (must match the server's classifier - see
+# INPUT_SIZE in the AI_Model repo's onnx_backend.py). Requesting the spawn
+# image at this size from Discord's media proxy means we download a much
+# smaller payload and skip a resize the server would otherwise have to do.
+SPAWN_IMAGE_SIZE = 224
 # Skip a queued spawn if it waited longer than this (seconds) - the answer
 # would arrive too late to be useful, and skipping lets the queue catch up.
 MAX_SPAWN_AGE = 15.0
@@ -915,14 +920,24 @@ def _to_media_proxy(url: str) -> str:
     cdn.discordapp.com (raw storage) measured 150-750ms and erratic from the AI_Model
     host; media.discordapp.net (Discord's image proxy) measured a consistent ~150ms
     from the same host. Route every fetch through the proxy instead of raw storage.
+
+    Also asks the proxy to resize down to SPAWN_IMAGE_SIZE - the model resizes to
+    this anyway, so fetching it pre-shrunk cuts the download payload and skips
+    that resize work server-side. Discord's media proxy fits-within (preserves
+    aspect ratio, no stretching/cropping), so this is lossless in the sense that
+    it doesn't change what the model would have seen after its own resize step.
+    Any existing query params (e.g. the cdn signature tokens ex/is/hm) are kept.
     """
     try:
         parts = urlsplit(url)
     except ValueError:
         return url
     host = (parts.hostname or "").lower()
-    if host in ("cdn.discordapp.com", "images-ext-1.discordapp.net"):
-        parts = parts._replace(netloc="media.discordapp.net")
+    if host in ("cdn.discordapp.com", "images-ext-1.discordapp.net", "media.discordapp.net"):
+        query = dict(parse_qsl(parts.query))
+        query["width"] = str(SPAWN_IMAGE_SIZE)
+        query["height"] = str(SPAWN_IMAGE_SIZE)
+        parts = parts._replace(netloc="media.discordapp.net", query=urlencode(query))
         return parts.geturl()
     return url
 
