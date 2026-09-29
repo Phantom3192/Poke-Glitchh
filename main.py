@@ -105,6 +105,7 @@ from dotenv import load_dotenv
 
 import pokedata
 from guild_store import store as guild_store
+from turso_db import db as turso
 
 try:
     import psutil  # optional: CPU/RAM numbers for s!ping. Bot works fine without it.
@@ -333,7 +334,7 @@ bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=
 # -- per-guild naming on/off --
 DISABLED_GUILDS_FILE = os.getenv("DISABLED_GUILDS_FILE", "disabled_guilds.json")
 
-def _load_disabled_guilds() -> set:
+def _load_disabled_guilds_file() -> set:
     try:
         with open(DISABLED_GUILDS_FILE, "r") as f:
             return {int(x) for x in json.load(f)}
@@ -343,7 +344,26 @@ def _load_disabled_guilds() -> set:
         log.error(f"Couldn't parse {DISABLED_GUILDS_FILE}, starting with nothing disabled: {e}")
         return set()
 
+def _load_disabled_guilds() -> set:
+    if not turso.enabled:
+        return _load_disabled_guilds_file()
+    found = {int(r[0]) for r in turso.query("SELECT guild_id FROM disabled_guilds")}
+    if not found and turso.kv_get("migrated:disabled_guilds") is None:
+        found = _load_disabled_guilds_file()          # one-time import of the old JSON file
+        if found:
+            turso.execute([("INSERT OR IGNORE INTO disabled_guilds(guild_id) VALUES(?)", [str(g)])
+                           for g in found])
+            log.info(f"Imported {len(found)} disabled guild(s) from {DISABLED_GUILDS_FILE} into Turso")
+        turso.kv_set("migrated:disabled_guilds", "1")
+    return found
+
 def _save_disabled_guilds() -> None:
+    if turso.enabled:
+        # replace the whole (tiny) set atomically, in order, on the background writer
+        turso.submit([("DELETE FROM disabled_guilds", [])] +
+                     [("INSERT INTO disabled_guilds(guild_id) VALUES(?)", [str(g)])
+                      for g in sorted(DISABLED_GUILDS)])
+        return
     try:
         with open(DISABLED_GUILDS_FILE, "w") as f:
             json.dump(sorted(DISABLED_GUILDS), f)
@@ -1729,7 +1749,10 @@ async def _backfill_audit_log(channel_name: str, message_id: int, species: str, 
             log.warning(f"Backfill: couldn't write audit log: {e}")
 
 
-def _load_backfill_checkpoint() -> dict:
+_BACKFILL_CK_KEY = "backfill_checkpoint"
+
+
+def _load_backfill_checkpoint_file() -> dict:
     try:
         with open(BACKFILL_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -1740,9 +1763,33 @@ def _load_backfill_checkpoint() -> dict:
         return {}
 
 
+def _load_backfill_checkpoint() -> dict:
+    if not turso.enabled:
+        return _load_backfill_checkpoint_file()
+    try:
+        raw = turso.kv_get(_BACKFILL_CK_KEY)
+        if raw is not None:
+            return json.loads(raw)
+        if turso.kv_get("migrated:backfill_checkpoint") is None:   # one-time import of old file
+            ck = _load_backfill_checkpoint_file()
+            if ck:
+                turso.kv_set(_BACKFILL_CK_KEY, json.dumps(ck))
+                log.info(f"Imported {BACKFILL_CHECKPOINT_PATH} into Turso")
+            turso.kv_set("migrated:backfill_checkpoint", "1")
+            return ck
+        return {}
+    except Exception as e:
+        log.error(f"Couldn't load backfill checkpoint from Turso: {e}")
+        return {}
+
+
 async def _save_backfill_checkpoint(checkpoint: dict) -> None:
-    """Atomic write (tmp file + rename) so a crash mid-save can't corrupt the checkpoint file."""
+    """Turso: queued to the background writer (atomic upsert, never blocks the loop).
+    Fallback: atomic tmp-file + rename so a crash mid-save can't corrupt the file."""
     async with _backfill_checkpoint_lock:
+        if turso.enabled:
+            turso.kv_set_async(_BACKFILL_CK_KEY, json.dumps(checkpoint))
+            return
         try:
             tmp = BACKFILL_CHECKPOINT_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
