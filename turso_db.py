@@ -108,8 +108,11 @@ class TursoDB:
             self._thread.start()
             atexit.register(self.flush)
             log.info(f"Turso enabled ({self._url})")
+            print(f"[turso] connected: {self._url}", flush=True)
         else:
             log.info("Turso not configured (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN) - using local JSON files")
+            print("[turso] NOT configured - set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. "
+                  "Using local JSON files (data will NOT persist on hosts that wipe disk).", flush=True)
 
     # -- low level --
     def _pipeline(self, requests: list) -> list:
@@ -216,4 +219,4 @@ class TursoDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", [key, value])
 
 
-db = TursoDB(os.getenv("TURSO_DATABASE_URL"), os.getenv("TURSO_AUTH_TOKEN"))
+db = TursoDB(os.getenv("TURSO_DATABASE_URL") or os.getenv("TURSO_URL"), os.getenv("TURSO_AUTH_TOKEN"))
