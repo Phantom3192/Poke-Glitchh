@@ -2683,6 +2683,7 @@ async def cl_cmd(ctx: commands.Context, action: Optional[str] = None, *, species
     s!cl add <pokemon> [pokemon2 ...]   - get pinged in this server when it spawns
     s!cl remove <pokemon> [pokemon2 ...]
     s!cl list
+    s!cl clear                          - empty your whole collection in this server
     """
     if ctx.guild is None:
         await ctx.send("This only works in a server.")
@@ -2697,13 +2698,17 @@ async def cl_cmd(ctx: commands.Context, action: Optional[str] = None, *, species
         removed = guild_store.collection_remove(ctx.guild.id, ctx.author.id, names)
         await ctx.send(f"**Removed:** {', '.join(_display(n) for n in removed)}" if removed
                         else "None of those were in your collection.")
+    elif action == "clear":
+        n = guild_store.collection_clear(ctx.guild.id, ctx.author.id)
+        await ctx.send(f"Cleared your collection ({n} Pokemon removed)." if n
+                        else "Your collection is already empty.")
     elif action in ("list", "", None):
         mine = guild_store.collection_list(ctx.guild.id, ctx.author.id)
         await ctx.send("Your collection is empty." if not mine else
                         "**Your collection:** " + ", ".join(_display(n) for n in mine))
     else:
         await ctx.send(f"Usage: `{COMMAND_PREFIX}cl add <pokemon>`, `{COMMAND_PREFIX}cl remove <pokemon>`, "
-                        f"or `{COMMAND_PREFIX}cl list`.")
+                        f"`{COMMAND_PREFIX}cl list`, or `{COMMAND_PREFIX}cl clear`.")
 
 
 @bot.group(name="res", invoke_without_command=True)
@@ -2712,6 +2717,8 @@ async def res_cmd(ctx: commands.Context, action: Optional[str] = None, *, rest: 
     s!res add <pokemon> [pokemon2 ...] @user   - reserve species to @user (silences their collection ping)
     s!res remove <pokemon> [pokemon2 ...] @user
     s!res list [@user]
+    s!res search <pokemon> [pokemon2 ...]       - see who has each species reserved
+    s!res clear                                 - wipe ALL reservations in this server (res role / Manage Server)
     s!res role @role                            - (Manage Server) set who's allowed to use res add/remove
     """
     if ctx.guild is None:
@@ -2756,6 +2763,29 @@ async def res_cmd(ctx: commands.Context, action: Optional[str] = None, *, rest: 
                             f"**from** {target.mention}." if removed else "None of those were reserved.")
         return
 
+    if action == "clear":
+        if not await _has_res_role(ctx):
+            await ctx.send("You don't have the role allowed to use `res` in this server.")
+            return
+        n = guild_store.reserve_clear_guild(ctx.guild.id)
+        await ctx.send(f"Cleared all reservations in this server ({n} removed)." if n
+                        else "There were no reservations in this server.")
+        return
+
+    if action == "search":
+        names = _parse_species_list(rest)
+        if not names:
+            await ctx.send(f"Usage: `{COMMAND_PREFIX}res search <pokemon> [pokemon2 ...]`")
+            return
+        lines = []
+        for n in names:
+            holders = guild_store.reserve_matches(ctx.guild.id, n)
+            who = ", ".join(f"<@{uid}>" for uid in sorted(holders)) if holders else "nobody"
+            lines.append(f"**{_display(n)}** - reserved by {who}")
+        # allowed_mentions=none: show the names without actually pinging anyone
+        await ctx.send("\n".join(lines)[:1990], allowed_mentions=discord.AllowedMentions.none())
+        return
+
     if action in ("list", "", None):
         target = ctx.message.mentions[0] if ctx.message.mentions else ctx.author
         mine = guild_store.reserve_list(ctx.guild.id, target.id)
@@ -2764,7 +2794,8 @@ async def res_cmd(ctx: commands.Context, action: Optional[str] = None, *, rest: 
         return
 
     await ctx.send(f"Usage: `{COMMAND_PREFIX}res add <pokemon> @user`, `{COMMAND_PREFIX}res remove <pokemon> @user`, "
-                    f"`{COMMAND_PREFIX}res list [@user]`, or `{COMMAND_PREFIX}res role @role`.")
+                    f"`{COMMAND_PREFIX}res list [@user]`, `{COMMAND_PREFIX}res search <pokemon>`, "
+                    f"`{COMMAND_PREFIX}res clear`, or `{COMMAND_PREFIX}res role @role`.")
 
 
 @bot.command(name="sh")
@@ -2800,8 +2831,10 @@ async def help_cmd(ctx: commands.Context):
     )
     embed.add_field(name="Everyone", value=(
         f"`{COMMAND_PREFIX}cl add/remove/list <pokemon>` - ping me when it spawns\n"
+        f"`{COMMAND_PREFIX}cl clear` - empty my whole collection\n"
         f"`{COMMAND_PREFIX}sh <pokemon>` / `clear` - shiny hunt one Pokemon\n"
         f"`{COMMAND_PREFIX}res list [@user]` - view reserves\n"
+        f"`{COMMAND_PREFIX}res search <pokemon>` - who has it reserved\n"
         f"`{COMMAND_PREFIX}ping` - bot latency/health\n"
         f"`{COMMAND_PREFIX}model` - which AI model is running\n"
         f"`{COMMAND_PREFIX}naming` - is spawn-naming on in this server?"
@@ -2810,6 +2843,7 @@ async def help_cmd(ctx: commands.Context):
         f"`{COMMAND_PREFIX}res add <pokemon> @user` - reserve a species to someone "
         f"(silences their collection ping for it)\n"
         f"`{COMMAND_PREFIX}res remove <pokemon> @user`\n"
+        f"`{COMMAND_PREFIX}res clear` - wipe every reservation in this server\n"
         f"`{COMMAND_PREFIX}res role @role` - set who's allowed to use res add/remove"
     ), inline=False)
     embed.add_field(name="Bot owner", value=(
