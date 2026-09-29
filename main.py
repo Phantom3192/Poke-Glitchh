@@ -2677,6 +2677,52 @@ async def model_cmd(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 
+class _ConfirmView(discord.ui.View):
+    """Confirm / Cancel buttons. Only the person who ran the command can press them."""
+
+    def __init__(self, author_id: int, timeout: float = 30.0):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.value: Optional[bool] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can answer this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
+
+
+async def _confirm_clear(ctx: commands.Context, prompt: str, timeout: float = 30.0):
+    """Ask the author to confirm a destructive action with buttons.
+    Returns (confirmed, message). If not confirmed, the message is already edited to say
+    'Cancelled.' / 'Timed out.' (buttons removed). If confirmed, the caller does the action
+    and then edits `message` with the result (pass view=None to keep buttons off)."""
+    view = _ConfirmView(ctx.author.id, timeout)
+    msg = await ctx.send(f"{prompt}\n-# Confirm within {int(timeout)}s.", view=view)
+    await view.wait()
+    if view.value is True:
+        return True, msg
+    try:
+        await msg.edit(content="Cancelled." if view.value is False else "Timed out - nothing was cleared.",
+                       view=None)
+    except discord.HTTPException:
+        pass
+    return False, msg
+
+
 @bot.group(name="cl", invoke_without_command=True)
 async def cl_cmd(ctx: commands.Context, action: Optional[str] = None, *, species: str = ""):
     """
@@ -2699,9 +2745,16 @@ async def cl_cmd(ctx: commands.Context, action: Optional[str] = None, *, species
         await ctx.send(f"**Removed:** {', '.join(_display(n) for n in removed)}" if removed
                         else "None of those were in your collection.")
     elif action == "clear":
-        n = guild_store.collection_clear(ctx.guild.id, ctx.author.id)
-        await ctx.send(f"Cleared your collection ({n} Pokemon removed)." if n
-                        else "Your collection is already empty.")
+        count = len(guild_store.collection_list(ctx.guild.id, ctx.author.id))
+        if not count:
+            await ctx.send("Your collection is already empty.")
+            return
+        ok, msg = await _confirm_clear(
+            ctx, f"{ctx.author.mention} clear your **entire collection** in this server "
+                 f"(**{count}** Pokemon)? This can't be undone.")
+        if ok:
+            n = guild_store.collection_clear(ctx.guild.id, ctx.author.id)
+            await msg.edit(content=f"Cleared your collection ({n} Pokemon removed).", view=None)
     elif action in ("list", "", None):
         mine = guild_store.collection_list(ctx.guild.id, ctx.author.id)
         await ctx.send("Your collection is empty." if not mine else
@@ -2767,9 +2820,16 @@ async def res_cmd(ctx: commands.Context, action: Optional[str] = None, *, rest: 
         if not await _has_res_role(ctx):
             await ctx.send("You don't have the role allowed to use `res` in this server.")
             return
-        n = guild_store.reserve_clear_guild(ctx.guild.id)
-        await ctx.send(f"Cleared all reservations in this server ({n} removed)." if n
-                        else "There were no reservations in this server.")
+        count = guild_store.reserve_count(ctx.guild.id)
+        if not count:
+            await ctx.send("There are no reservations in this server.")
+            return
+        ok, msg = await _confirm_clear(
+            ctx, f"{ctx.author.mention} clear **every reservation in this server** "
+                 f"(**{count}** entries, for all users)? This can't be undone.")
+        if ok:
+            n = guild_store.reserve_clear_guild(ctx.guild.id)
+            await msg.edit(content=f"Cleared all reservations in this server ({n} removed).", view=None)
         return
 
     if action == "search":
@@ -2814,8 +2874,15 @@ async def shiny_hunt_cmd(ctx: commands.Context, *, species: Optional[str] = None
                         else "You're not shiny hunting anything right now.")
         return
     if species.strip().lower() == "clear":
-        guild_store.shiny_set(ctx.guild.id, ctx.author.id, None)
-        await ctx.send("Shiny hunt cleared.")
+        current = guild_store.shiny_get(ctx.guild.id, ctx.author.id)
+        if not current:
+            await ctx.send("You're not shiny hunting anything right now.")
+            return
+        ok, msg = await _confirm_clear(
+            ctx, f"{ctx.author.mention} stop shiny hunting **{_display(current)}**?")
+        if ok:
+            guild_store.shiny_set(ctx.guild.id, ctx.author.id, None)
+            await msg.edit(content=f"Shiny hunt for **{_display(current)}** cleared.", view=None)
         return
     name = species.strip()
     guild_store.shiny_set(ctx.guild.id, ctx.author.id, name)
