@@ -198,6 +198,15 @@ class GuildStore:
     def collection_list(self, guild_id: int, user_id: int) -> list:
         return self._list_get("collection", guild_id, user_id)
 
+    def collection_clear(self, guild_id: int, user_id: int) -> int:
+        """Empty one user's collection in this guild. Returns how many species were removed."""
+        n = len(self._guild(guild_id)["collection"].get(str(user_id), []))
+        self._guild(guild_id)["collection"].pop(str(user_id), None)
+        if n:
+            self._persist([("DELETE FROM collection WHERE guild_id = ? AND user_id = ?",
+                            [str(guild_id), str(user_id)])])
+        return n
+
     def collection_matches(self, guild_id: int, species: str) -> Set[int]:
         """User IDs (in this guild) whose collection contains this species."""
         return self._list_matches("collection", guild_id, species)
@@ -214,6 +223,15 @@ class GuildStore:
 
     def reserve_matches(self, guild_id: int, species: str) -> Set[int]:
         return self._list_matches("reserve", guild_id, species)
+
+    def reserve_clear_guild(self, guild_id: int) -> int:
+        """Wipe every reservation in this guild. Returns how many species entries were removed."""
+        g = self._guild(guild_id)
+        n = sum(len(v) for v in g["reserve"].values())
+        g["reserve"] = {}
+        if n:
+            self._persist([("DELETE FROM reserve WHERE guild_id = ?", [str(guild_id)])])
+        return n
 
     # ---------------- reserve role ----------------
     def set_res_role(self, guild_id: int, role_id: Optional[int]) -> None:
