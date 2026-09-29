@@ -224,6 +224,10 @@ class GuildStore:
     def reserve_matches(self, guild_id: int, species: str) -> Set[int]:
         return self._list_matches("reserve", guild_id, species)
 
+    def reserve_count(self, guild_id: int) -> int:
+        """Total species entries reserved in this guild (across all users)."""
+        return sum(len(v) for v in self._guild(guild_id)["reserve"].values())
+
     def reserve_clear_guild(self, guild_id: int) -> int:
         """Wipe every reservation in this guild. Returns how many species entries were removed."""
         g = self._guild(guild_id)
